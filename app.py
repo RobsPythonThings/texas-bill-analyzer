@@ -1,9 +1,13 @@
 # app.py
 import io
 import re
+import urllib3
 from flask import Flask, request, jsonify
 import requests
 from pdfminer.high_level import extract_text
+
+# Disable SSL warnings for demo purposes
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
@@ -31,7 +35,7 @@ def summarize_text_locally(text: str, max_chars: int = 1200) -> str:
     if not text:
         return "No extractable text was found in the PDF."
 
-    # crude “section start” heuristics to capture bill intro + first items
+    # crude "section start" heuristics to capture bill intro + first items
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     head = []
     for ln in lines[:80]:  # first ~80 logical lines
@@ -192,7 +196,7 @@ def summarize_by_url():
         return jsonify({"error": "pdf_url is required"}), 400
 
     try:
-        r = requests.get(pdf_url, timeout=25)
+        r = requests.get(pdf_url, timeout=25, verify=False)
     except Exception as e:
         return jsonify({"error": f"fetch failed: {e}"}), 400
 
