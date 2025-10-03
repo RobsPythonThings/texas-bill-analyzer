@@ -1,15 +1,12 @@
-# app.py
 from flask import Flask, request, jsonify
-import os, requests, tempfile
+import requests
+import tempfile
 import fitz  # PyMuPDF
-from openai import OpenAI
 
 app = Flask(__name__)
 
-# set this after deploy: heroku config:set OPENAI_API_KEY=xxxxx
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    """Take raw PDF bytes and return extracted text."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(pdf_bytes)
         tmp.flush()
@@ -25,35 +22,37 @@ def health():
 @app.post("/summarizeByUrl")
 def summarize_by_url():
     """
-    JSON body: { "pdf_url": "https://..." }
-    Returns: { "summary": "...", "source_url": "..." }
+    Demo endpoint. Takes JSON: { "pdf_url": "https://..." }
+    Fetches PDF, extracts some text, and returns a canned summary.
     """
     data = request.get_json(silent=True) or {}
     pdf_url = data.get("pdf_url")
     if not pdf_url:
         return jsonify({"error": "Provide 'pdf_url' in JSON body."}), 400
 
-    r = requests.get(pdf_url, timeout=60)
-    if r.status_code != 200:
-        return jsonify({"error": f"fetch failed: {r.status_code}"}), 400
+    try:
+        # Fetch PDF from URL
+        r = requests.get(pdf_url, timeout=60)
+        if r.status_code != 200:
+            return jsonify({"error": f"fetch failed: {r.status_code}"}), 400
 
-    full_text = extract_text_from_pdf_bytes(r.content)[:200000]  # safety cap
+        # Extract text (first 500 chars just to prove it works)
+        full_text = extract_text_from_pdf_bytes(r.content)
+        snippet = full_text[:500].replace("\n", " ")
 
-    prompt = (
-        "You are a legislative analyst. Summarize this Texas bill.\n"
-        "Return:\n- 4–8 concise bullet points\n- funding/appropriations\n"
-        "- effective dates\n- cite sections if obvious."
-    )
+        # Stub summary (replace with OpenAI/Gemini call later if desired)
+        summary = (
+            f"Demo summary for {pdf_url}. "
+            "Key points extracted from the PDF: "
+            f"{snippet[:200]}..."
+        )
 
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.2,
-        max_tokens=700,
-        messages=[
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": full_text},
-        ],
-    )
+        return jsonify({
+            "summary": summary,
+            "source_url": pdf_url
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-    summary = resp.choices[0].message.content.strip()
-    return jsonify({"summary": summary, "source_url": pdf_url})
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
