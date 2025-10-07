@@ -62,7 +62,7 @@ def build_openapi_json(base_url: str) -> dict:
     """
     return {
         "openapi": "3.0.0",
-        "info": {"title": "Texas Bill Summarizer API", "version": "1.2.0"},
+        "info": {"title": "Texas Bill Summarizer API", "version": "1.3.0"},
         "servers": [{"url": base_url.rstrip("/")}],
         "paths": {
             "/health": {
@@ -389,6 +389,76 @@ def get_fiscal_note():
     return jsonify({
         "url": fiscal_note_url,
         "text": text,
+        "exists": True
+    })
+
+@app.route("/getBillByNumber", methods=["POST"])
+def get_bill_by_number():
+    """
+    Fetch and summarize a bill by bill number (e.g., "HB 103", "SB 45")
+    Constructs the Telicon bill PDF URL automatically.
+    """
+    payload = request.get_json(silent=True) or {}
+    bill_number = payload.get("bill_number")
+    
+    # DEBUG LOGGING
+    print(f"[DEBUG getBillByNumber] Received payload: {payload}")
+    print(f"[DEBUG getBillByNumber] Extracted bill_number: {bill_number}")
+    
+    if not bill_number:
+        print("[ERROR getBillByNumber] bill_number is missing from request")
+        return jsonify({"error": "bill_number is required (e.g., 'HB 103')"}), 400
+    
+    # Parse bill number (e.g., "HB 103" or "HB103")
+    match = re.match(r"([HS][BRJ])\s*(\d+)", bill_number.upper().strip())
+    if not match:
+        print(f"[ERROR getBillByNumber] Invalid bill format: {bill_number}")
+        return jsonify({"error": "Invalid bill format. Use 'HB 103' or 'SB 45'"}), 400
+    
+    bill_type = match.group(1)
+    bill_num = match.group(2).zfill(5)  # Zero-pad to 5 digits
+    
+    # Construct bill PDF URL
+    bill_pdf_url = f"https://www.telicon.com/www/TX/89R/pdf/TX89R{bill_type}{bill_num}FIL.pdf"
+    
+    print(f"[DEBUG getBillByNumber] Constructed URL: {bill_pdf_url}")
+    print(f"[DEBUG getBillByNumber] Bill type: {bill_type}, Bill number (padded): {bill_num}")
+    
+    # Fetch the bill PDF
+    try:
+        r = requests.get(bill_pdf_url, timeout=25, verify=False)
+        print(f"[DEBUG getBillByNumber] Response status: {r.status_code}")
+    except Exception as e:
+        print(f"[ERROR getBillByNumber] Fetch failed with exception: {e}")
+        return jsonify({"error": f"fetch failed: {e}"}), 400
+
+    if r.status_code == 404:
+        print(f"[INFO getBillByNumber] Bill not found (404) for {bill_number}")
+        return jsonify({
+            "bill_number": bill_number,
+            "url": bill_pdf_url,
+            "exists": False,
+            "message": "Bill not found"
+        }), 404
+
+    if r.status_code != 200 or not r.content:
+        print(f"[ERROR getBillByNumber] Bad response - Status: {r.status_code}")
+        return jsonify({"error": f"fetch failed: {r.status_code}"}), 400
+
+    # Extract text and summarize
+    text = extract_text_from_pdf_bytes(r.content)
+    if not text:
+        print("[ERROR getBillByNumber] Failed to extract text from bill PDF")
+        return jsonify({"error": "no text extracted from bill"}), 500
+
+    print(f"[DEBUG getBillByNumber] Successfully extracted {len(text)} characters from bill {bill_number}")
+    summary = summarize_text_locally(text)
+    print(f"[DEBUG getBillByNumber] Generated summary of {len(summary)} characters")
+    
+    return jsonify({
+        "bill_number": bill_number,
+        "url": bill_pdf_url,
+        "summary": summary,
         "exists": True
     })
 
