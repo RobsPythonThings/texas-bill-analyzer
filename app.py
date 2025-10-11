@@ -34,19 +34,17 @@ SF_API_VERSION = 'v65.0'
 # Salesforce Helper Functions
 # -----------------------------
 def get_salesforce_access_token():
-    """Authenticate with Salesforce and get access token."""
-    if not all([SF_CLIENT_ID, SF_CLIENT_SECRET, SF_USERNAME, SF_PASSWORD]):
+    """Authenticate with Salesforce using Client Credentials flow."""
+    if not all([SF_CLIENT_ID, SF_CLIENT_SECRET]):
         print('[WARN] Salesforce credentials not configured')
         return None
     
     auth_url = f"{SF_INSTANCE_URL}/services/oauth2/token"
     
     payload = {
-        'grant_type': 'password',
+        'grant_type': 'client_credentials',
         'client_id': SF_CLIENT_ID,
-        'client_secret': SF_CLIENT_SECRET,
-        'username': SF_USERNAME,
-        'password': SF_PASSWORD + SF_SECURITY_TOKEN
+        'client_secret': SF_CLIENT_SECRET
     }
     
     try:
