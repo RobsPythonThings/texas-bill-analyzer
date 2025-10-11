@@ -1,4 +1,4 @@
-# app.py - RESILIENT VERSION
+# app.py - VERSION 2.1 WITH FISCAL IMPACT EXTRACTION
 import io
 import os
 import re
@@ -33,6 +33,57 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
     except Exception as e:
         print(f"[ERROR] PDF extraction failed: {e}")
         return ""
+
+def extract_fiscal_impacts(fiscal_note_text: str) -> list:
+    """
+    Extract structured fiscal impact data from fiscal note text.
+    Returns list of dicts: [{"year": "2026", "amount": -88715399}, ...]
+    """
+    if not fiscal_note_text:
+        return []
+    
+    impacts = []
+    seen_years = set()  # Avoid duplicates
+    
+    # Pattern: Match fiscal years with dollar amounts
+    # Handles: "FY 2026: $88,715,399" or "2026: ($88,715,399)" or "2026 $88,715,399"
+    pattern = r'(?:FY\s*)?(\d{4})[:\s]+\(?\$?([\d,]+(?:\.\d{2})?)\)?'
+    
+    matches = re.finditer(pattern, fiscal_note_text)
+    
+    for match in matches:
+        year = match.group(1)
+        
+        # Skip if not a valid fiscal year (2020-2040 range)
+        if not (2020 <= int(year) <= 2040):
+            continue
+            
+        # Skip duplicate years
+        if year in seen_years:
+            continue
+        
+        amount_str = match.group(2).replace(',', '')
+        
+        try:
+            amount = float(amount_str)
+            
+            # Check if it's in parentheses (negative) by looking at context
+            match_text = fiscal_note_text[match.start():match.end()]
+            if '(' in match_text:
+                amount = -amount
+            
+            impacts.append({
+                "year": year,
+                "amount": amount
+            })
+            
+            seen_years.add(year)
+            
+        except ValueError:
+            continue
+    
+    print(f"[INFO] Extracted {len(impacts)} fiscal impacts from fiscal note")
+    return impacts
 
 def parse_bill_number(bill_number: str) -> tuple:
     """
@@ -137,8 +188,8 @@ def build_openapi_json(base_url: str) -> dict:
         "openapi": "3.0.0",
         "info": {
             "title": "Texas Bill Analyzer API",
-            "version": "2.0.0",
-            "description": "API for analyzing Texas legislative bills and fiscal notes"
+            "version": "2.1.0",
+            "description": "API for analyzing Texas legislative bills with structured fiscal impact extraction"
         },
         "servers": [{"url": base_url.rstrip("/")}],
         "paths": {
@@ -191,7 +242,7 @@ def build_openapi_json(base_url: str) -> dict:
             "/analyzeBill": {
                 "post": {
                     "operationId": "analyzeBill",
-                    "summary": "Analyze Texas bill and auto-fetch fiscal note if relevant",
+                    "summary": "Analyze Texas bill with structured fiscal impact data",
                     "requestBody": {
                         "required": True,
                         "content": {
@@ -225,6 +276,16 @@ def build_openapi_json(base_url: str) -> dict:
                                             "fiscal_note_url": {"type": "string"},
                                             "bill_text": {"type": "string"},
                                             "fiscal_note_text": {"type": "string"},
+                                            "fiscal_impacts": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "year": {"type": "string"},
+                                                        "amount": {"type": "number"}
+                                                    }
+                                                }
+                                            },
                                             "has_fiscal_note": {"type": "boolean"},
                                             "fiscal_was_relevant": {"type": "boolean"},
                                             "exists": {"type": "boolean"},
@@ -283,7 +344,7 @@ def build_openapi_json(base_url: str) -> dict:
             "/getFiscalNoteByBill": {
                 "post": {
                     "operationId": "getFiscalNoteByBill",
-                    "summary": "Fetch fiscal note by bill number",
+                    "summary": "Fetch fiscal note with structured impact data",
                     "requestBody": {
                         "required": True,
                         "content": {
@@ -300,7 +361,7 @@ def build_openapi_json(base_url: str) -> dict:
                     },
                     "responses": {
                         "200": {
-                            "description": "Fiscal note retrieved",
+                            "description": "Fiscal note retrieved with structured data",
                             "content": {
                                 "application/json": {
                                     "schema": {
@@ -309,6 +370,16 @@ def build_openapi_json(base_url: str) -> dict:
                                             "bill_number": {"type": "string"},
                                             "fiscal_note_text": {"type": "string"},
                                             "fiscal_note_url": {"type": "string"},
+                                            "fiscal_impacts": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "year": {"type": "string"},
+                                                        "amount": {"type": "number"}
+                                                    }
+                                                }
+                                            },
                                             "exists": {"type": "boolean"}
                                         }
                                     }
@@ -331,7 +402,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Texas Bill Analyzer",
-        "version": "2.0.0"
+        "version": "2.1.0"
     })
 
 @app.route("/session", methods=["GET"])
@@ -346,7 +417,7 @@ def get_current_session():
 @app.route("/analyzeBill", methods=["POST"])
 def analyze_bill():
     """
-    Smart endpoint that analyzes a bill and automatically fetches fiscal note if relevant.
+    Smart endpoint that analyzes a bill and automatically extracts structured fiscal impact data.
     This is the PRIMARY endpoint for Salesforce to use.
     """
     payload = request.get_json(silent=True) or {}
@@ -408,6 +479,7 @@ def analyze_bill():
     fiscal_exists = False
     fiscal_url = None
     fiscal_pattern = None
+    fiscal_impacts = []
     
     if fiscal_relevant:
         fiscal_url, fiscal_pattern = try_fiscal_note_patterns(bill_type, bill_num, session)
@@ -419,8 +491,11 @@ def analyze_bill():
                 if fiscal_response.status_code == 200:
                     fiscal_text = extract_text_from_pdf_bytes(fiscal_response.content)
                     fiscal_exists = bool(fiscal_text)
+                    
                     if fiscal_exists:
                         print(f"[INFO] analyzeBill - Fiscal note found: {len(fiscal_text)} characters")
+                        # NEW: Extract structured fiscal impacts
+                        fiscal_impacts = extract_fiscal_impacts(fiscal_text)
                     
             except Exception as e:
                 print(f"[WARN] analyzeBill - Fiscal note fetch failed: {e}")
@@ -434,11 +509,12 @@ def analyze_bill():
         "fiscal_note_url": fiscal_url or f"{TELICON_BASE_URL}/{session}/fnote/TX{session}{bill_type}{bill_num}FIL.pdf",
         "bill_text": bill_text[:3000],  # First 3000 chars for AI summarization
         "fiscal_note_text": fiscal_text[:3000] if fiscal_text else None,
+        "fiscal_impacts": fiscal_impacts,  # NEW: Structured fiscal data!
         "has_fiscal_note": fiscal_exists,
         "fiscal_was_relevant": fiscal_relevant,
         "exists": True,
         "success": True,
-        "url_pattern_used": bill_pattern  # For monitoring
+        "url_pattern_used": bill_pattern
     })
 
 @app.route("/getBillByNumber", methods=["POST"])
@@ -490,7 +566,7 @@ def get_bill_by_number():
 
 @app.route("/getFiscalNoteByBill", methods=["POST"])
 def get_fiscal_note_by_bill():
-    """Fetch fiscal note for a specific bill."""
+    """Fetch fiscal note with structured impact data for a specific bill."""
     payload = request.get_json(silent=True) or {}
     bill_number = payload.get("bill_number")
     
@@ -523,12 +599,16 @@ def get_fiscal_note_by_bill():
         if not fiscal_text:
             return jsonify({"error": "Could not extract fiscal note text"}), 500
         
-        print(f"[INFO] getFiscalNoteByBill - Success: {len(fiscal_text)} characters")
+        # NEW: Extract structured fiscal impacts
+        fiscal_impacts = extract_fiscal_impacts(fiscal_text)
+        
+        print(f"[INFO] getFiscalNoteByBill - Success: {len(fiscal_text)} characters, {len(fiscal_impacts)} impacts")
         
         return jsonify({
             "bill_number": f"{bill_type}{bill_num}",
             "fiscal_note_text": fiscal_text[:3000],
             "fiscal_note_url": fiscal_url,
+            "fiscal_impacts": fiscal_impacts,  # NEW!
             "exists": True
         })
         
@@ -552,6 +632,7 @@ def openapi_json():
 # -----------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
-    print(f"[INFO] Starting Texas Bill Analyzer on port {port}")
+    print(f"[INFO] Starting Texas Bill Analyzer v2.1 on port {port}")
     print(f"[INFO] Current legislative session: {CURRENT_SESSION}")
+    print(f"[INFO] NEW: Structured fiscal impact extraction enabled")
     app.run(host="0.0.0.0", port=port)
