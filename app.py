@@ -1,5 +1,6 @@
-# app.py
+# app.py - RESILIENT VERSION
 import io
+import os
 import re
 import urllib3
 from flask import Flask, request, jsonify
@@ -12,9 +13,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 
 # -----------------------------
-# Configuration
+# Configuration (Environment Variables)
 # -----------------------------
-CURRENT_SESSION = "89R"
+CURRENT_SESSION = os.environ.get('TX_LEGISLATURE_SESSION', '89R')
 TELICON_BASE_URL = "https://www.telicon.com/www/TX"
 
 # -----------------------------
@@ -45,6 +46,79 @@ def parse_bill_number(bill_number: str) -> tuple:
     bill_type = match.group(1)
     bill_num = match.group(2).zfill(5)  # Zero-pad to 5 digits
     return bill_type, bill_num
+
+def try_bill_url_patterns(bill_type: str, bill_num: str, session: str) -> tuple:
+    """
+    Try multiple URL patterns until one works.
+    Returns: (url, pattern_type) or (None, None)
+    """
+    patterns = [
+        # Current primary pattern
+        {
+            "url": f"{TELICON_BASE_URL}/{session}/pdf/TX{session}{bill_type}{bill_num}FIL.pdf",
+            "type": "primary"
+        },
+        # Fallback: Without session in filename
+        {
+            "url": f"{TELICON_BASE_URL}/{session}/pdf/{bill_type}{bill_num}FIL.pdf",
+            "type": "fallback_no_session_in_name"
+        },
+        # Fallback: Different directory structure
+        {
+            "url": f"{TELICON_BASE_URL}/{session}/bills/TX{session}{bill_type}{bill_num}.pdf",
+            "type": "fallback_bills_dir"
+        },
+        # Fallback: Flat structure
+        {
+            "url": f"{TELICON_BASE_URL}/bills/{session}/{bill_type}{bill_num}.pdf",
+            "type": "fallback_flat"
+        }
+    ]
+    
+    for pattern in patterns:
+        try:
+            response = requests.head(pattern["url"], timeout=5, verify=False)
+            if response.status_code == 200:
+                print(f"[SUCCESS] Found bill using {pattern['type']}: {pattern['url']}")
+                return pattern["url"], pattern["type"]
+        except Exception as e:
+            print(f"[RETRY] Pattern {pattern['type']} failed: {e}")
+            continue
+    
+    return None, None
+
+def try_fiscal_note_patterns(bill_type: str, bill_num: str, session: str) -> tuple:
+    """
+    Try multiple fiscal note URL patterns.
+    Returns: (url, pattern_type) or (None, None)
+    """
+    patterns = [
+        # Current primary pattern
+        {
+            "url": f"{TELICON_BASE_URL}/{session}/fnote/TX{session}{bill_type}{bill_num}FIL.pdf",
+            "type": "primary"
+        },
+        # Fallback patterns
+        {
+            "url": f"{TELICON_BASE_URL}/{session}/fnote/{bill_type}{bill_num}FIL.pdf",
+            "type": "fallback_no_session_in_name"
+        },
+        {
+            "url": f"{TELICON_BASE_URL}/{session}/fiscal/{bill_type}{bill_num}.pdf",
+            "type": "fallback_fiscal_dir"
+        }
+    ]
+    
+    for pattern in patterns:
+        try:
+            response = requests.head(pattern["url"], timeout=5, verify=False)
+            if response.status_code == 200:
+                print(f"[SUCCESS] Found fiscal note using {pattern['type']}: {pattern['url']}")
+                return pattern["url"], pattern["type"]
+        except:
+            continue
+    
+    return None, None
 
 def should_fetch_fiscal_note(bill_text: str) -> bool:
     """Determine if fiscal note is relevant based on bill content."""
@@ -81,7 +155,31 @@ def build_openapi_json(base_url: str) -> dict:
                                         "type": "object",
                                         "properties": {
                                             "ok": {"type": "boolean"},
-                                            "service": {"type": "string"}
+                                            "service": {"type": "string"},
+                                            "version": {"type": "string"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "/session": {
+                "get": {
+                    "operationId": "getCurrentSession",
+                    "summary": "Get current legislative session",
+                    "responses": {
+                        "200": {
+                            "description": "Current session info",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "session": {"type": "string"},
+                                            "session_year": {"type": "string"},
+                                            "chamber": {"type": "string"}
                                         }
                                     }
                                 }
@@ -130,7 +228,8 @@ def build_openapi_json(base_url: str) -> dict:
                                             "has_fiscal_note": {"type": "boolean"},
                                             "fiscal_was_relevant": {"type": "boolean"},
                                             "exists": {"type": "boolean"},
-                                            "success": {"type": "boolean"}
+                                            "success": {"type": "boolean"},
+                                            "url_pattern_used": {"type": "string"}
                                         }
                                     }
                                 }
@@ -235,6 +334,15 @@ def health():
         "version": "2.0.0"
     })
 
+@app.route("/session", methods=["GET"])
+def get_current_session():
+    """Return current legislative session being tracked."""
+    return jsonify({
+        "session": CURRENT_SESSION,
+        "session_year": "2025-2026" if CURRENT_SESSION == "89R" else "Unknown",
+        "chamber": "Texas Legislature"
+    })
+
 @app.route("/analyzeBill", methods=["POST"])
 def analyze_bill():
     """
@@ -258,27 +366,24 @@ def analyze_bill():
     
     session = CURRENT_SESSION
     
-    # Construct URLs
-    bill_url = f"{TELICON_BASE_URL}/{session}/pdf/TX{session}{bill_type}{bill_num}FIL.pdf"
-    fiscal_url = f"{TELICON_BASE_URL}/{session}/fnote/TX{session}{bill_type}{bill_num}FIL.pdf"
+    # Try multiple URL patterns for bill
+    bill_url, bill_pattern = try_bill_url_patterns(bill_type, bill_num, session)
     
-    print(f"[INFO] analyzeBill - Bill URL: {bill_url}")
+    if not bill_url:
+        print(f"[ERROR] analyzeBill - Bill not found: {bill_type}{bill_num}")
+        return jsonify({
+            "bill_number": f"{bill_type}{bill_num}",
+            "session": session,
+            "exists": False,
+            "message": f"Bill {bill_type}{bill_num} not found for session {session}",
+            "success": False
+        }), 404
     
     # Fetch bill PDF
     try:
         bill_response = requests.get(bill_url, timeout=25, verify=False)
         
-        if bill_response.status_code == 404:
-            print(f"[INFO] analyzeBill - Bill not found: {bill_type}{bill_num}")
-            return jsonify({
-                "bill_number": f"{bill_type}{bill_num}",
-                "exists": False,
-                "message": "Bill not found",
-                "success": False
-            }), 404
-        
         if bill_response.status_code != 200:
-            print(f"[ERROR] analyzeBill - HTTP {bill_response.status_code}")
             return jsonify({
                 "error": f"Failed to fetch bill (HTTP {bill_response.status_code})"
             }), 500
@@ -301,26 +406,24 @@ def analyze_bill():
     # Fetch fiscal note if relevant
     fiscal_text = None
     fiscal_exists = False
+    fiscal_url = None
+    fiscal_pattern = None
     
     if fiscal_relevant:
-        print(f"[INFO] analyzeBill - Fetching fiscal note: {fiscal_url}")
-        try:
-            fiscal_response = requests.get(fiscal_url, timeout=10, verify=False)
-            
-            if fiscal_response.status_code == 200:
-                fiscal_text = extract_text_from_pdf_bytes(fiscal_response.content)
-                fiscal_exists = bool(fiscal_text)
-                if fiscal_exists:
-                    print(f"[INFO] analyzeBill - Fiscal note found: {len(fiscal_text)} characters")
-                else:
-                    print("[WARN] analyzeBill - Fiscal note PDF found but text extraction failed")
-            else:
-                print(f"[INFO] analyzeBill - Fiscal note not available (HTTP {fiscal_response.status_code})")
+        fiscal_url, fiscal_pattern = try_fiscal_note_patterns(bill_type, bill_num, session)
+        
+        if fiscal_url:
+            try:
+                fiscal_response = requests.get(fiscal_url, timeout=10, verify=False)
                 
-        except Exception as e:
-            print(f"[WARN] analyzeBill - Fiscal note fetch failed: {e}")
-    else:
-        print("[INFO] analyzeBill - Skipping fiscal note (not relevant to bill content)")
+                if fiscal_response.status_code == 200:
+                    fiscal_text = extract_text_from_pdf_bytes(fiscal_response.content)
+                    fiscal_exists = bool(fiscal_text)
+                    if fiscal_exists:
+                        print(f"[INFO] analyzeBill - Fiscal note found: {len(fiscal_text)} characters")
+                    
+            except Exception as e:
+                print(f"[WARN] analyzeBill - Fiscal note fetch failed: {e}")
     
     # Return structured response
     return jsonify({
@@ -328,21 +431,19 @@ def analyze_bill():
         "bill_type": bill_type,
         "session": session,
         "bill_url": bill_url,
-        "fiscal_note_url": fiscal_url,
+        "fiscal_note_url": fiscal_url or f"{TELICON_BASE_URL}/{session}/fnote/TX{session}{bill_type}{bill_num}FIL.pdf",
         "bill_text": bill_text[:3000],  # First 3000 chars for AI summarization
         "fiscal_note_text": fiscal_text[:3000] if fiscal_text else None,
         "has_fiscal_note": fiscal_exists,
         "fiscal_was_relevant": fiscal_relevant,
         "exists": True,
-        "success": True
+        "success": True,
+        "url_pattern_used": bill_pattern  # For monitoring
     })
 
 @app.route("/getBillByNumber", methods=["POST"])
 def get_bill_by_number():
-    """
-    Simple endpoint to fetch just the bill text.
-    Use /analyzeBill for smarter logic.
-    """
+    """Simple endpoint to fetch just the bill text."""
     payload = request.get_json(silent=True) or {}
     bill_number = payload.get("bill_number")
     
@@ -355,17 +456,17 @@ def get_bill_by_number():
     if not bill_type or not bill_num:
         return jsonify({"error": "Invalid bill format"}), 400
     
-    bill_url = f"{TELICON_BASE_URL}/{CURRENT_SESSION}/pdf/TX{CURRENT_SESSION}{bill_type}{bill_num}FIL.pdf"
+    bill_url, pattern = try_bill_url_patterns(bill_type, bill_num, CURRENT_SESSION)
+    
+    if not bill_url:
+        return jsonify({
+            "bill_number": f"{bill_type}{bill_num}",
+            "exists": False,
+            "message": "Bill not found"
+        }), 404
     
     try:
         response = requests.get(bill_url, timeout=25, verify=False)
-        
-        if response.status_code == 404:
-            return jsonify({
-                "bill_number": f"{bill_type}{bill_num}",
-                "exists": False,
-                "message": "Bill not found"
-            }), 404
         
         if response.status_code != 200:
             return jsonify({"error": f"HTTP {response.status_code}"}), 500
@@ -402,18 +503,18 @@ def get_fiscal_note_by_bill():
     if not bill_type or not bill_num:
         return jsonify({"error": "Invalid bill format"}), 400
     
-    fiscal_url = f"{TELICON_BASE_URL}/{CURRENT_SESSION}/fnote/TX{CURRENT_SESSION}{bill_type}{bill_num}FIL.pdf"
+    fiscal_url, pattern = try_fiscal_note_patterns(bill_type, bill_num, CURRENT_SESSION)
+    
+    if not fiscal_url:
+        return jsonify({
+            "bill_number": f"{bill_type}{bill_num}",
+            "fiscal_note_url": f"{TELICON_BASE_URL}/{CURRENT_SESSION}/fnote/TX{CURRENT_SESSION}{bill_type}{bill_num}FIL.pdf",
+            "exists": False,
+            "message": "Fiscal note not yet available for this bill"
+        }), 404
     
     try:
         response = requests.get(fiscal_url, timeout=10, verify=False)
-        
-        if response.status_code == 404:
-            return jsonify({
-                "bill_number": f"{bill_type}{bill_num}",
-                "fiscal_note_url": fiscal_url,
-                "exists": False,
-                "message": "Fiscal note not yet available for this bill"
-            }), 404
         
         if response.status_code != 200:
             return jsonify({"error": f"HTTP {response.status_code}"}), 500
@@ -450,7 +551,7 @@ def openapi_json():
 # Main
 # -----------------------------
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", "5000"))
     print(f"[INFO] Starting Texas Bill Analyzer on port {port}")
+    print(f"[INFO] Current legislative session: {CURRENT_SESSION}")
     app.run(host="0.0.0.0", port=port)
