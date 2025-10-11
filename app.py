@@ -6,165 +6,146 @@ from flask import Flask, request, jsonify
 import requests
 from pdfminer.high_level import extract_text
 
-# Disable SSL warnings for demo purposes
+# Disable SSL warnings for Telicon (uses self-signed cert)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
 # -----------------------------
-# Helpers
+# Configuration
+# -----------------------------
+CURRENT_SESSION = "89R"
+TELICON_BASE_URL = "https://www.telicon.com/www/TX"
+
+# -----------------------------
+# Helper Functions
 # -----------------------------
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
-    """Return plain text from a PDF byte string. Empty string on failure."""
+    """Extract plain text from PDF bytes. Returns empty string on failure."""
     try:
         with io.BytesIO(pdf_bytes) as fh:
             txt = extract_text(fh) or ""
-            # Normalize whitespace a bit so we can display clean excerpts
+            # Normalize whitespace
             txt = re.sub(r"[ \t]+", " ", txt)
             txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
             return txt
-    except Exception:
+    except Exception as e:
+        print(f"[ERROR] PDF extraction failed: {e}")
         return ""
 
-def summarize_text_locally(text: str, max_chars: int = 1200) -> str:
+def parse_bill_number(bill_number: str) -> tuple:
     """
-    Super-light 'summary' for demo purposes:
-    - If the doc is long, grab the intro + first section headings/snippets.
-    - Keep it short and deterministic so your demo is stable.
+    Parse bill number into (bill_type, bill_num).
+    Examples: "HB 150" -> ("HB", "00150"), "SB45" -> ("SB", "00045")
     """
-    if not text:
-        return "No extractable text was found in the PDF."
+    match = re.match(r"([HS][BRJ])\s*(\d+)", bill_number.upper().strip())
+    if not match:
+        return None, None
+    
+    bill_type = match.group(1)
+    bill_num = match.group(2).zfill(5)  # Zero-pad to 5 digits
+    return bill_type, bill_num
 
-    # crude "section start" heuristics to capture bill intro + first items
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    head = []
-    for ln in lines[:80]:  # first ~80 logical lines
-        head.append(ln)
-        # stop early if we hit a section marker
-        if re.search(r"^SECTION\s+\d+\.|^Sec\.\s*\d", ln, re.IGNORECASE):
-            break
-
-    excerpt = " ".join(head)
-    if len(excerpt) < 300:
-        excerpt = " ".join(lines[:200])  # fall back to a bit more context
-
-    excerpt = excerpt[:max_chars].rstrip()
-    return (
-        "Summary (rule-based, demo):\n"
-        "- Captures the bill header and early sections for context.\n"
-        "- Use this as a stand-in for Document/ADL summarization.\n\n"
-        f"{excerpt}"
-    )
+def should_fetch_fiscal_note(bill_text: str) -> bool:
+    """Determine if fiscal note is relevant based on bill content."""
+    fiscal_keywords = [
+        "appropriation", "funding", "budget", "fiscal impact",
+        "cost", "revenue", "expenditure", "million", "billion",
+        "grant", "allocation", "financial"
+    ]
+    
+    bill_text_lower = bill_text.lower()
+    return any(keyword in bill_text_lower for keyword in fiscal_keywords)
 
 def build_openapi_json(base_url: str) -> dict:
-    """
-    Minimal OpenAPI 3.0 describing all endpoints for External Services.
-    """
+    """OpenAPI 3.0 specification for External Services."""
     return {
         "openapi": "3.0.0",
-        "info": {"title": "Texas Bill Summarizer API", "version": "1.3.0"},
+        "info": {
+            "title": "Texas Bill Analyzer API",
+            "version": "2.0.0",
+            "description": "API for analyzing Texas legislative bills and fiscal notes"
+        },
         "servers": [{"url": base_url.rstrip("/")}],
         "paths": {
             "/health": {
                 "get": {
                     "operationId": "health",
-                    "summary": "Health check",
+                    "summary": "Health check endpoint",
                     "responses": {
                         "200": {
-                            "description": "OK",
+                            "description": "Service is healthy",
                             "content": {
                                 "application/json": {
                                     "schema": {
                                         "type": "object",
-                                        "required": ["ok"],
-                                        "properties": {"ok": {"type": "boolean"}},
+                                        "properties": {
+                                            "ok": {"type": "boolean"},
+                                            "service": {"type": "string"}
+                                        }
                                     }
-                                }
-                            },
-                        }
-                    },
-                }
-            },
-            "/summarizeFile": {
-                "post": {
-                    "operationId": "summarizeFile",
-                    "summary": "Upload and summarize a Texas bill PDF",
-                    "requestBody": {
-                        "required": True,
-                        "content": {
-                            "multipart/form-data": {
-                                "schema": {
-                                    "type": "object",
-                                    "required": ["file"],
-                                    "properties": {
-                                        "file": {"type": "string", "format": "binary"}
-                                    },
                                 }
                             }
-                        },
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "Summary response",
-                            "content": {
-                                "application/json": {
-                                    "schema": {
-                                        "type": "object",
-                                        "required": ["filename", "summary"],
-                                        "properties": {
-                                            "filename": {"type": "string"},
-                                            "summary": {"type": "string"},
-                                        },
-                                    }
-                                }
-                            },
-                        },
-                        "400": {"description": "Bad Request"},
-                        "500": {"description": "Server Error"},
-                    },
+                        }
+                    }
                 }
             },
-            "/summarizeByUrl": {
+            "/analyzeBill": {
                 "post": {
-                    "operationId": "summarizeByUrl",
-                    "summary": "Summarize a Texas bill PDF by URL",
+                    "operationId": "analyzeBill",
+                    "summary": "Analyze Texas bill and auto-fetch fiscal note if relevant",
                     "requestBody": {
                         "required": True,
                         "content": {
                             "application/json": {
                                 "schema": {
                                     "type": "object",
-                                    "required": ["pdf_url"],
-                                    "properties": {"pdf_url": {"type": "string"}},
+                                    "required": ["bill_number"],
+                                    "properties": {
+                                        "bill_number": {
+                                            "type": "string",
+                                            "description": "Bill number (e.g., 'HB 150', 'SB45')"
+                                        }
+                                    }
                                 }
                             }
-                        },
+                        }
                     },
                     "responses": {
                         "200": {
-                            "description": "Summary response",
+                            "description": "Bill analysis successful",
                             "content": {
                                 "application/json": {
                                     "schema": {
                                         "type": "object",
-                                        "required": ["url", "summary"],
+                                        "required": ["bill_number", "exists", "success"],
                                         "properties": {
-                                            "url": {"type": "string"},
-                                            "summary": {"type": "string"},
-                                        },
+                                            "bill_number": {"type": "string"},
+                                            "bill_type": {"type": "string"},
+                                            "session": {"type": "string"},
+                                            "bill_url": {"type": "string"},
+                                            "fiscal_note_url": {"type": "string"},
+                                            "bill_text": {"type": "string"},
+                                            "fiscal_note_text": {"type": "string"},
+                                            "has_fiscal_note": {"type": "boolean"},
+                                            "fiscal_was_relevant": {"type": "boolean"},
+                                            "exists": {"type": "boolean"},
+                                            "success": {"type": "boolean"}
+                                        }
                                     }
                                 }
-                            },
+                            }
                         },
-                        "400": {"description": "Bad Request"},
-                        "500": {"description": "Server Error"},
-                    },
+                        "400": {"description": "Invalid request"},
+                        "404": {"description": "Bill not found"},
+                        "500": {"description": "Server error"}
+                    }
                 }
             },
             "/getBillByNumber": {
                 "post": {
                     "operationId": "getBillByNumber",
-                    "summary": "Fetch and summarize bill by bill number (e.g., 'HB 103')",
+                    "summary": "Fetch bill text by bill number",
                     "requestBody": {
                         "required": True,
                         "content": {
@@ -174,111 +155,36 @@ def build_openapi_json(base_url: str) -> dict:
                                     "required": ["bill_number"],
                                     "properties": {
                                         "bill_number": {"type": "string"}
-                                    },
+                                    }
                                 }
                             }
-                        },
+                        }
                     },
                     "responses": {
                         "200": {
-                            "description": "Bill summary",
+                            "description": "Bill text retrieved",
                             "content": {
                                 "application/json": {
                                     "schema": {
                                         "type": "object",
-                                        "required": ["bill_number", "url", "summary", "exists"],
                                         "properties": {
                                             "bill_number": {"type": "string"},
-                                            "url": {"type": "string"},
-                                            "summary": {"type": "string"},
-                                            "exists": {"type": "boolean"},
-                                        },
+                                            "bill_text": {"type": "string"},
+                                            "bill_url": {"type": "string"},
+                                            "exists": {"type": "boolean"}
+                                        }
                                     }
-                                }
-                            },
-                        },
-                        "400": {"description": "Bad Request"},
-                        "404": {
-                            "description": "Bill not found",
-                            "content": {
-                                "application/json": {
-                                    "schema": {
-                                        "type": "object",
-                                        "required": ["bill_number", "url", "exists", "message"],
-                                        "properties": {
-                                            "bill_number": {"type": "string"},
-                                            "url": {"type": "string"},
-                                            "exists": {"type": "boolean"},
-                                            "message": {"type": "string"},
-                                        },
-                                    }
-                                }
-                            },
-                        },
-                        "500": {"description": "Server Error"},
-                    },
-                }
-            },
-            "/getFiscalNote": {
-                "post": {
-                    "operationId": "getFiscalNote",
-                    "summary": "Fetch and extract text from a Texas fiscal note PDF by URL",
-                    "requestBody": {
-                        "required": True,
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "required": ["fiscal_note_url"],
-                                    "properties": {
-                                        "fiscal_note_url": {"type": "string"}
-                                    },
                                 }
                             }
                         },
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "Fiscal note content",
-                            "content": {
-                                "application/json": {
-                                    "schema": {
-                                        "type": "object",
-                                        "required": ["url", "text", "exists"],
-                                        "properties": {
-                                            "url": {"type": "string"},
-                                            "text": {"type": "string"},
-                                            "exists": {"type": "boolean"},
-                                        },
-                                    }
-                                }
-                            },
-                        },
-                        "400": {"description": "Bad Request"},
-                        "404": {
-                            "description": "Fiscal note not found",
-                            "content": {
-                                "application/json": {
-                                    "schema": {
-                                        "type": "object",
-                                        "required": ["url", "exists", "message"],
-                                        "properties": {
-                                            "url": {"type": "string"},
-                                            "exists": {"type": "boolean"},
-                                            "message": {"type": "string"},
-                                        },
-                                    }
-                                }
-                            },
-                        },
-                        "500": {"description": "Server Error"},
-                    },
+                        "404": {"description": "Bill not found"}
+                    }
                 }
             },
             "/getFiscalNoteByBill": {
                 "post": {
                     "operationId": "getFiscalNoteByBill",
-                    "summary": "Fetch fiscal note by bill number (e.g., 'HB 103')",
+                    "summary": "Fetch fiscal note by bill number",
                     "requestBody": {
                         "required": True,
                         "content": {
@@ -288,318 +194,263 @@ def build_openapi_json(base_url: str) -> dict:
                                     "required": ["bill_number"],
                                     "properties": {
                                         "bill_number": {"type": "string"}
-                                    },
+                                    }
                                 }
                             }
-                        },
+                        }
                     },
                     "responses": {
                         "200": {
-                            "description": "Fiscal note content",
+                            "description": "Fiscal note retrieved",
                             "content": {
                                 "application/json": {
                                     "schema": {
                                         "type": "object",
-                                        "required": ["bill_number", "url", "text", "exists"],
                                         "properties": {
                                             "bill_number": {"type": "string"},
-                                            "url": {"type": "string"},
-                                            "text": {"type": "string"},
-                                            "exists": {"type": "boolean"},
-                                        },
+                                            "fiscal_note_text": {"type": "string"},
+                                            "fiscal_note_url": {"type": "string"},
+                                            "exists": {"type": "boolean"}
+                                        }
                                     }
                                 }
-                            },
+                            }
                         },
-                        "400": {"description": "Bad Request"},
-                        "404": {
-                            "description": "Fiscal note not found",
-                            "content": {
-                                "application/json": {
-                                    "schema": {
-                                        "type": "object",
-                                        "required": ["bill_number", "url", "exists", "message"],
-                                        "properties": {
-                                            "bill_number": {"type": "string"},
-                                            "url": {"type": "string"},
-                                            "exists": {"type": "boolean"},
-                                            "message": {"type": "string"},
-                                        },
-                                    }
-                                }
-                            },
-                        },
-                        "500": {"description": "Server Error"},
-                    },
+                        "404": {"description": "Fiscal note not found"}
+                    }
                 }
-            },
-        },
+            }
+        }
     }
 
 # -----------------------------
-# Routes
+# API Routes
 # -----------------------------
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True})
+    """Health check endpoint."""
+    return jsonify({
+        "ok": True,
+        "service": "Texas Bill Analyzer",
+        "version": "2.0.0"
+    })
 
-@app.route("/summarizeFile", methods=["POST"])
-def summarize_file():
-    if "file" not in request.files:
-        return jsonify({"error": "file is required (multipart/form-data)"}), 400
-
-    f = request.files["file"]
-    data = f.read()
-    if not data:
-        return jsonify({"error": "empty file"}), 400
-
-    text = extract_text_from_pdf_bytes(data)
-    if not text:
-        return jsonify({"error": "no text extracted"}), 500
-
-    summary = summarize_text_locally(text)
-    return jsonify({"filename": f.filename or "uploaded.pdf", "summary": summary})
-
-@app.route("/summarizeByUrl", methods=["POST"])
-def summarize_by_url():
+@app.route("/analyzeBill", methods=["POST"])
+def analyze_bill():
+    """
+    Smart endpoint that analyzes a bill and automatically fetches fiscal note if relevant.
+    This is the PRIMARY endpoint for Salesforce to use.
+    """
     payload = request.get_json(silent=True) or {}
-    pdf_url = payload.get("pdf_url")
+    bill_number = payload.get("bill_number")
     
-    # DEBUG LOGGING
-    print(f"[DEBUG summarizeByUrl] Received payload: {payload}")
-    print(f"[DEBUG summarizeByUrl] Extracted pdf_url: {pdf_url}")
+    print(f"[INFO] analyzeBill - Request for: {bill_number}")
     
-    if not pdf_url:
-        print("[ERROR summarizeByUrl] pdf_url is missing from request")
-        return jsonify({"error": "pdf_url is required"}), 400
-
-    print(f"[DEBUG summarizeByUrl] Fetching PDF from: {pdf_url}")
+    if not bill_number:
+        return jsonify({"error": "bill_number is required (e.g., 'HB 150')"}), 400
     
+    # Parse bill number
+    bill_type, bill_num = parse_bill_number(bill_number)
+    if not bill_type or not bill_num:
+        return jsonify({
+            "error": "Invalid bill format. Use 'HB 150' or 'SB 45'"
+        }), 400
+    
+    session = CURRENT_SESSION
+    
+    # Construct URLs
+    bill_url = f"{TELICON_BASE_URL}/{session}/pdf/TX{session}{bill_type}{bill_num}FIL.pdf"
+    fiscal_url = f"{TELICON_BASE_URL}/{session}/fnote/TX{session}{bill_type}{bill_num}FIL.pdf"
+    
+    print(f"[INFO] analyzeBill - Bill URL: {bill_url}")
+    
+    # Fetch bill PDF
     try:
-        r = requests.get(pdf_url, timeout=25, verify=False)
-        print(f"[DEBUG summarizeByUrl] Response status: {r.status_code}, Content length: {len(r.content) if r.content else 0}")
+        bill_response = requests.get(bill_url, timeout=25, verify=False)
+        
+        if bill_response.status_code == 404:
+            print(f"[INFO] analyzeBill - Bill not found: {bill_type}{bill_num}")
+            return jsonify({
+                "bill_number": f"{bill_type}{bill_num}",
+                "exists": False,
+                "message": "Bill not found",
+                "success": False
+            }), 404
+        
+        if bill_response.status_code != 200:
+            print(f"[ERROR] analyzeBill - HTTP {bill_response.status_code}")
+            return jsonify({
+                "error": f"Failed to fetch bill (HTTP {bill_response.status_code})"
+            }), 500
+            
     except Exception as e:
-        print(f"[ERROR summarizeByUrl] Fetch failed with exception: {e}")
-        return jsonify({"error": f"fetch failed: {e}"}), 400
-
-    if r.status_code != 200 or not r.content:
-        print(f"[ERROR summarizeByUrl] Bad response - Status: {r.status_code}")
-        return jsonify({"error": f"fetch failed: {r.status_code}"}), 400
-
-    text = extract_text_from_pdf_bytes(r.content)
-    if not text:
-        print("[ERROR summarizeByUrl] Failed to extract text from PDF")
-        return jsonify({"error": "no text extracted"}), 500
-
-    print(f"[DEBUG summarizeByUrl] Successfully extracted {len(text)} characters")
-    summary = summarize_text_locally(text)
-    print(f"[DEBUG summarizeByUrl] Generated summary of {len(summary)} characters")
+        print(f"[ERROR] analyzeBill - Fetch failed: {e}")
+        return jsonify({"error": f"Network error: {str(e)}"}), 500
     
-    return jsonify({"url": pdf_url, "summary": summary})
+    # Extract bill text
+    bill_text = extract_text_from_pdf_bytes(bill_response.content)
+    if not bill_text:
+        return jsonify({"error": "Could not extract text from bill PDF"}), 500
+    
+    print(f"[INFO] analyzeBill - Extracted {len(bill_text)} characters from bill")
+    
+    # Decide if fiscal note is relevant
+    fiscal_relevant = should_fetch_fiscal_note(bill_text)
+    print(f"[INFO] analyzeBill - Fiscal note relevant: {fiscal_relevant}")
+    
+    # Fetch fiscal note if relevant
+    fiscal_text = None
+    fiscal_exists = False
+    
+    if fiscal_relevant:
+        print(f"[INFO] analyzeBill - Fetching fiscal note: {fiscal_url}")
+        try:
+            fiscal_response = requests.get(fiscal_url, timeout=10, verify=False)
+            
+            if fiscal_response.status_code == 200:
+                fiscal_text = extract_text_from_pdf_bytes(fiscal_response.content)
+                fiscal_exists = bool(fiscal_text)
+                if fiscal_exists:
+                    print(f"[INFO] analyzeBill - Fiscal note found: {len(fiscal_text)} characters")
+                else:
+                    print("[WARN] analyzeBill - Fiscal note PDF found but text extraction failed")
+            else:
+                print(f"[INFO] analyzeBill - Fiscal note not available (HTTP {fiscal_response.status_code})")
+                
+        except Exception as e:
+            print(f"[WARN] analyzeBill - Fiscal note fetch failed: {e}")
+    else:
+        print("[INFO] analyzeBill - Skipping fiscal note (not relevant to bill content)")
+    
+    # Return structured response
+    return jsonify({
+        "bill_number": f"{bill_type}{bill_num}",
+        "bill_type": bill_type,
+        "session": session,
+        "bill_url": bill_url,
+        "fiscal_note_url": fiscal_url,
+        "bill_text": bill_text[:3000],  # First 3000 chars for AI summarization
+        "fiscal_note_text": fiscal_text[:3000] if fiscal_text else None,
+        "has_fiscal_note": fiscal_exists,
+        "fiscal_was_relevant": fiscal_relevant,
+        "exists": True,
+        "success": True
+    })
 
 @app.route("/getBillByNumber", methods=["POST"])
 def get_bill_by_number():
     """
-    Fetch and summarize a bill by bill number (e.g., "HB 103", "SB 45")
-    Constructs the Telicon bill PDF URL automatically.
+    Simple endpoint to fetch just the bill text.
+    Use /analyzeBill for smarter logic.
     """
     payload = request.get_json(silent=True) or {}
     bill_number = payload.get("bill_number")
     
-    # DEBUG LOGGING
-    print(f"[DEBUG getBillByNumber] Received payload: {payload}")
-    print(f"[DEBUG getBillByNumber] Extracted bill_number: {bill_number}")
+    print(f"[INFO] getBillByNumber - Request for: {bill_number}")
     
     if not bill_number:
-        print("[ERROR getBillByNumber] bill_number is missing from request")
-        return jsonify({"error": "bill_number is required (e.g., 'HB 103')"}), 400
+        return jsonify({"error": "bill_number is required"}), 400
     
-    # Parse bill number (e.g., "HB 103" or "HB103")
-    match = re.match(r"([HS][BRJ])\s*(\d+)", bill_number.upper().strip())
-    if not match:
-        print(f"[ERROR getBillByNumber] Invalid bill format: {bill_number}")
-        return jsonify({"error": "Invalid bill format. Use 'HB 103' or 'SB 45'"}), 400
+    bill_type, bill_num = parse_bill_number(bill_number)
+    if not bill_type or not bill_num:
+        return jsonify({"error": "Invalid bill format"}), 400
     
-    bill_type = match.group(1)
-    bill_num = match.group(2).zfill(5)  # Zero-pad to 5 digits
-    
-    # Construct bill PDF URL
-    bill_pdf_url = f"https://www.telicon.com/www/TX/89R/pdf/TX89R{bill_type}{bill_num}FIL.pdf"
-    
-    print(f"[DEBUG getBillByNumber] Constructed URL: {bill_pdf_url}")
-    print(f"[DEBUG getBillByNumber] Bill type: {bill_type}, Bill number (padded): {bill_num}")
-    
-    # Fetch the bill PDF
-    try:
-        r = requests.get(bill_pdf_url, timeout=25, verify=False)
-        print(f"[DEBUG getBillByNumber] Response status: {r.status_code}")
-    except Exception as e:
-        print(f"[ERROR getBillByNumber] Fetch failed with exception: {e}")
-        return jsonify({"error": f"fetch failed: {e}"}), 400
-
-    if r.status_code == 404:
-        print(f"[INFO getBillByNumber] Bill not found (404) for {bill_number}")
-        return jsonify({
-            "bill_number": bill_number,
-            "url": bill_pdf_url,
-            "exists": False,
-            "message": "Bill not found"
-        }), 404
-
-    if r.status_code != 200 or not r.content:
-        print(f"[ERROR getBillByNumber] Bad response - Status: {r.status_code}")
-        return jsonify({"error": f"fetch failed: {r.status_code}"}), 400
-
-    # Extract text and summarize
-    text = extract_text_from_pdf_bytes(r.content)
-    if not text:
-        print("[ERROR getBillByNumber] Failed to extract text from bill PDF")
-        return jsonify({"error": "no text extracted from bill"}), 500
-
-    print(f"[DEBUG getBillByNumber] Successfully extracted {len(text)} characters from bill {bill_number}")
-    summary = summarize_text_locally(text)
-    print(f"[DEBUG getBillByNumber] Generated summary of {len(summary)} characters")
-    
-    return jsonify({
-        "bill_number": bill_number,
-        "url": bill_pdf_url,
-        "summary": summary,
-        "exists": True
-    })
-
-@app.route("/getFiscalNote", methods=["POST"])
-def get_fiscal_note():
-    """
-    Fetch a Texas fiscal note PDF and return its full text.
-    Returns 404 with exists=false if the fiscal note doesn't exist yet.
-    """
-    payload = request.get_json(silent=True) or {}
-    fiscal_note_url = payload.get("fiscal_note_url")
-    
-    # DEBUG LOGGING
-    print(f"[DEBUG getFiscalNote] Received payload: {payload}")
-    print(f"[DEBUG getFiscalNote] Extracted fiscal_note_url: {fiscal_note_url}")
-    
-    if not fiscal_note_url:
-        print("[ERROR getFiscalNote] fiscal_note_url is missing from request")
-        return jsonify({"error": "fiscal_note_url is required"}), 400
-
-    print(f"[DEBUG getFiscalNote] Fetching fiscal note from: {fiscal_note_url}")
+    bill_url = f"{TELICON_BASE_URL}/{CURRENT_SESSION}/pdf/TX{CURRENT_SESSION}{bill_type}{bill_num}FIL.pdf"
     
     try:
-        r = requests.get(fiscal_note_url, timeout=25, verify=False)
-        print(f"[DEBUG getFiscalNote] Response status: {r.status_code}")
-    except Exception as e:
-        print(f"[ERROR getFiscalNote] Fetch failed with exception: {e}")
-        return jsonify({"error": f"fetch failed: {e}"}), 400
-
-    # Handle 404 gracefully - fiscal note may not exist yet
-    if r.status_code == 404:
-        print(f"[INFO getFiscalNote] Fiscal note not found (404) - may not be published yet")
+        response = requests.get(bill_url, timeout=25, verify=False)
+        
+        if response.status_code == 404:
+            return jsonify({
+                "bill_number": f"{bill_type}{bill_num}",
+                "exists": False,
+                "message": "Bill not found"
+            }), 404
+        
+        if response.status_code != 200:
+            return jsonify({"error": f"HTTP {response.status_code}"}), 500
+        
+        bill_text = extract_text_from_pdf_bytes(response.content)
+        if not bill_text:
+            return jsonify({"error": "Could not extract bill text"}), 500
+        
+        print(f"[INFO] getBillByNumber - Success: {len(bill_text)} characters")
+        
         return jsonify({
-            "url": fiscal_note_url,
-            "exists": False,
-            "message": "Fiscal note not yet available for this bill"
-        }), 404
-
-    # Other non-200 status codes are errors
-    if r.status_code != 200 or not r.content:
-        print(f"[ERROR getFiscalNote] Bad response - Status: {r.status_code}")
-        return jsonify({"error": f"fetch failed: {r.status_code}"}), 400
-
-    # Extract full text from the fiscal note PDF
-    text = extract_text_from_pdf_bytes(r.content)
-    if not text:
-        print("[ERROR getFiscalNote] Failed to extract text from fiscal note PDF")
-        return jsonify({"error": "no text extracted from fiscal note"}), 500
-
-    print(f"[DEBUG getFiscalNote] Successfully extracted {len(text)} characters from fiscal note")
-    return jsonify({
-        "url": fiscal_note_url,
-        "text": text,
-        "exists": True
-    })
+            "bill_number": f"{bill_type}{bill_num}",
+            "bill_text": bill_text[:3000],
+            "bill_url": bill_url,
+            "exists": True
+        })
+        
+    except Exception as e:
+        print(f"[ERROR] getBillByNumber - {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/getFiscalNoteByBill", methods=["POST"])
 def get_fiscal_note_by_bill():
-    """
-    Fetch fiscal note by bill number (e.g., "HB 103", "SB 45")
-    Constructs the Telicon URL automatically.
-    """
+    """Fetch fiscal note for a specific bill."""
     payload = request.get_json(silent=True) or {}
     bill_number = payload.get("bill_number")
     
-    # DEBUG LOGGING
-    print(f"[DEBUG getFiscalNoteByBill] Received payload: {payload}")
-    print(f"[DEBUG getFiscalNoteByBill] Extracted bill_number: {bill_number}")
+    print(f"[INFO] getFiscalNoteByBill - Request for: {bill_number}")
     
     if not bill_number:
-        print("[ERROR getFiscalNoteByBill] bill_number is missing from request")
-        return jsonify({"error": "bill_number is required (e.g., 'HB 103')"}), 400
+        return jsonify({"error": "bill_number is required"}), 400
     
-    # Parse bill number (e.g., "HB 103" or "HB103")
-    match = re.match(r"([HS][BRJ])\s*(\d+)", bill_number.upper().strip())
-    if not match:
-        print(f"[ERROR getFiscalNoteByBill] Invalid bill format: {bill_number}")
-        return jsonify({"error": "Invalid bill format. Use 'HB 103' or 'SB 45'"}), 400
+    bill_type, bill_num = parse_bill_number(bill_number)
+    if not bill_type or not bill_num:
+        return jsonify({"error": "Invalid bill format"}), 400
     
-    bill_type = match.group(1)
-    bill_num = match.group(2).zfill(5)  # Zero-pad to 5 digits
+    fiscal_url = f"{TELICON_BASE_URL}/{CURRENT_SESSION}/fnote/TX{CURRENT_SESSION}{bill_type}{bill_num}FIL.pdf"
     
-    # Construct fiscal note URL
-    fiscal_note_url = f"https://www.telicon.com/www/TX/89R/fnote/TX89R{bill_type}{bill_num}FIL.pdf"
-    
-    print(f"[DEBUG getFiscalNoteByBill] Constructed URL: {fiscal_note_url}")
-    print(f"[DEBUG getFiscalNoteByBill] Bill type: {bill_type}, Bill number (padded): {bill_num}")
-    
-    # Now use the same logic as getFiscalNote
     try:
-        r = requests.get(fiscal_note_url, timeout=25, verify=False)
-        print(f"[DEBUG getFiscalNoteByBill] Response status: {r.status_code}")
-    except Exception as e:
-        print(f"[ERROR getFiscalNoteByBill] Fetch failed with exception: {e}")
-        return jsonify({"error": f"fetch failed: {e}"}), 400
-
-    if r.status_code == 404:
-        print(f"[INFO getFiscalNoteByBill] Fiscal note not found (404) for {bill_number}")
+        response = requests.get(fiscal_url, timeout=10, verify=False)
+        
+        if response.status_code == 404:
+            return jsonify({
+                "bill_number": f"{bill_type}{bill_num}",
+                "fiscal_note_url": fiscal_url,
+                "exists": False,
+                "message": "Fiscal note not yet available for this bill"
+            }), 404
+        
+        if response.status_code != 200:
+            return jsonify({"error": f"HTTP {response.status_code}"}), 500
+        
+        fiscal_text = extract_text_from_pdf_bytes(response.content)
+        if not fiscal_text:
+            return jsonify({"error": "Could not extract fiscal note text"}), 500
+        
+        print(f"[INFO] getFiscalNoteByBill - Success: {len(fiscal_text)} characters")
+        
         return jsonify({
-            "bill_number": bill_number,
-            "url": fiscal_note_url,
-            "exists": False,
-            "message": "Fiscal note not yet available for this bill"
-        }), 404
-
-    if r.status_code != 200 or not r.content:
-        print(f"[ERROR getFiscalNoteByBill] Bad response - Status: {r.status_code}")
-        return jsonify({"error": f"fetch failed: {r.status_code}"}), 400
-
-    text = extract_text_from_pdf_bytes(r.content)
-    if not text:
-        print("[ERROR getFiscalNoteByBill] Failed to extract text from fiscal note PDF")
-        return jsonify({"error": "no text extracted from fiscal note"}), 500
-
-    print(f"[DEBUG getFiscalNoteByBill] Successfully extracted {len(text)} characters from fiscal note for {bill_number}")
-    return jsonify({
-        "bill_number": bill_number,
-        "url": fiscal_note_url,
-        "text": text,
-        "exists": True
-    })
+            "bill_number": f"{bill_type}{bill_num}",
+            "fiscal_note_text": fiscal_text[:3000],
+            "fiscal_note_url": fiscal_url,
+            "exists": True
+        })
+        
+    except Exception as e:
+        print(f"[ERROR] getFiscalNoteByBill - {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/openapi.json", methods=["GET"])
 def openapi_json():
-    # Use the incoming host to build an accurate server URL for External Services
+    """OpenAPI specification for Salesforce External Services."""
     base = request.host_url.rstrip("/")
-    # Force https in Heroku context for External Services sanity
+    
+    # Force HTTPS for Heroku
     if base.startswith("http://"):
         base = "https://" + base[len("http://"):]
+    
     return jsonify(build_openapi_json(base))
 
 # -----------------------------
 # Main
 # -----------------------------
 if __name__ == "__main__":
-    # Heroku sets PORT; default for local runs
     import os
     port = int(os.environ.get("PORT", "5000"))
+    print(f"[INFO] Starting Texas Bill Analyzer on port {port}")
     app.run(host="0.0.0.0", port=port)
