@@ -35,9 +35,9 @@ SF_API_VERSION = 'v65.0'
 # -----------------------------
 def get_salesforce_access_token():
     """Authenticate with Salesforce using Client Credentials flow."""
-    def get_salesforce_access_token():
+def get_salesforce_access_token():
     """Authenticate with Salesforce using Username-Password flow."""
-    
+
     if not all([SF_CLIENT_ID, SF_CLIENT_SECRET, SF_USERNAME, SF_PASSWORD]):
         print('[WARN] Salesforce credentials not configured')
         return None
