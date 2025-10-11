@@ -35,19 +35,22 @@ SF_API_VERSION = 'v65.0'
 # -----------------------------
 def get_salesforce_access_token():
     """Authenticate with Salesforce using Client Credentials flow."""
+    def get_salesforce_access_token():
+    """Authenticate with Salesforce using Username-Password flow."""
+    
     if not all([SF_CLIENT_ID, SF_CLIENT_SECRET, SF_USERNAME, SF_PASSWORD]):
         print('[WARN] Salesforce credentials not configured')
         return None
-   
-auth_url = "https://test.salesforce.com/services/oauth2/token"
+    
+    auth_url = "https://test.salesforce.com/services/oauth2/token"
     
     payload = {
-    'grant_type': 'password',
-    'client_id': SF_CLIENT_ID,
-    'client_secret': SF_CLIENT_SECRET,
-    'username': SF_USERNAME,
-    'password': SF_PASSWORD + SF_SECURITY_TOKEN
-}
+        'grant_type': 'password',
+        'client_id': SF_CLIENT_ID,
+        'client_secret': SF_CLIENT_SECRET,
+        'username': SF_USERNAME,
+        'password': SF_PASSWORD + SF_SECURITY_TOKEN
+    }
     
     try:
         response = requests.post(auth_url, data=payload, timeout=10)
@@ -62,8 +65,7 @@ auth_url = "https://test.salesforce.com/services/oauth2/token"
             
     except Exception as e:
         print(f'[ERROR] Salesforce auth exception: {e}')
-        return None
-
+    return None
 def create_salesforce_record(object_name, data, access_token):
     """Create a record in Salesforce."""
     url = f"{SF_INSTANCE_URL}/services/data/{SF_API_VERSION}/sobjects/{object_name}"
