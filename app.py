@@ -76,17 +76,21 @@ def infer_impact_type(context_text: str, year: str) -> str:
 def extract_fiscal_impacts(fiscal_note_text: str) -> list:
     """
     Extract structured fiscal impact data from fiscal note text.
-    Returns list of dicts with full Financial_Impact__c fields.
+    Returns list of dicts: [{"year": "2026", "amount": -88715399}, ...]
     """
     if not fiscal_note_text:
         return []
     
+    # ADD THIS DEBUG LINE RIGHT HERE (after the empty check)
+    print(f"[DEBUG] First 1000 chars of fiscal note: {fiscal_note_text[:1000]}")
+    
     impacts = []
     seen_years = set()
     
-    # Pattern: Match fiscal years with dollar amounts and surrounding context
-    # Captures 100 chars before and after for context
+# Pattern: Match fiscal years with dollar amounts and surrounding context
     pattern = r'.{0,100}(?:FY\s*)?(\d{4})[:\s]+\(?\$?([\d,]+(?:\.\d{2})?)\)?.{0,100}'
+    
+    # ... rest of the function continues
     
     matches = re.finditer(pattern, fiscal_note_text, re.IGNORECASE)
     
