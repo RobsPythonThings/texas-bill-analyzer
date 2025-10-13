@@ -1,4 +1,4 @@
-# app.py - VERSION 3.0 WITH SALESFORCE INTEGRATION
+# app.py - PRODUCTION VERSION 4.0 (Salesforce Auth Removed)
 import io
 import os
 import re
@@ -6,7 +6,6 @@ import urllib3
 from flask import Flask, request, jsonify
 import requests
 from pdfminer.high_level import extract_text
-import json
 
 # Disable SSL warnings for Telicon (uses self-signed cert)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -14,106 +13,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 
 # -----------------------------
-# Configuration (Environment Variables)
+# Configuration
 # -----------------------------
 CURRENT_SESSION = os.environ.get('TX_LEGISLATURE_SESSION', '89R')
 TELICON_BASE_URL = "https://www.telicon.com/www/TX"
-
-# Salesforce credentials (set via Heroku config vars tomorrow)
-SF_INSTANCE_URL = os.environ.get('SF_INSTANCE_URL', 'https://storm-e5f313f236a2a7.lightning.force.com')
-SF_CLIENT_ID = os.environ.get('SF_CLIENT_ID', '')
-SF_CLIENT_SECRET = os.environ.get('SF_CLIENT_SECRET', '')
-SF_USERNAME = os.environ.get('SF_USERNAME', '')
-SF_PASSWORD = os.environ.get('SF_PASSWORD', '')
-SF_SECURITY_TOKEN = os.environ.get('SF_SECURITY_TOKEN', '')
-
-# Salesforce API version
-SF_API_VERSION = 'v65.0'
-
-# -----------------------------
-# Salesforce Helper Functions
-# -----------------------------
-def get_salesforce_access_token():
-    """Authenticate with Salesforce using Client Credentials flow."""
-def get_salesforce_access_token():
-    """Authenticate with Salesforce using Username-Password flow."""
-
-    if not all([SF_CLIENT_ID, SF_CLIENT_SECRET, SF_USERNAME, SF_PASSWORD]):
-        print('[WARN] Salesforce credentials not configured')
-        return None
-    
-    auth_url = "https://test.salesforce.com/services/oauth2/token"
-    
-    payload = {
-        'grant_type': 'password',
-        'client_id': SF_CLIENT_ID,
-        'client_secret': SF_CLIENT_SECRET,
-        'username': SF_USERNAME,
-        'password': SF_PASSWORD + SF_SECURITY_TOKEN
-    }
-    
-    try:
-        response = requests.post(auth_url, data=payload, timeout=10)
-        
-        if response.status_code == 200:
-            result = response.json()
-            print('[SUCCESS] Salesforce authentication successful')
-            return result['access_token']
-        else:
-            print(f'[ERROR] Salesforce auth failed: {response.status_code} - {response.text}')
-            return None
-            
-    except Exception as e:
-        print(f'[ERROR] Salesforce auth exception: {e}')
-    return None
-def create_salesforce_record(object_name, data, access_token):
-    """Create a record in Salesforce."""
-    url = f"{SF_INSTANCE_URL}/services/data/{SF_API_VERSION}/sobjects/{object_name}"
-    
-    headers = {
-        'Authorization': f'Bearer {access_token}',
-        'Content-Type': 'application/json'
-    }
-    
-    try:
-        response = requests.post(url, json=data, headers=headers, timeout=10)
-        
-        if response.status_code == 201:
-            result = response.json()
-            print(f'[SUCCESS] Created {object_name}: {result["id"]}')
-            return result['id']
-        else:
-            print(f'[ERROR] Failed to create {object_name}: {response.status_code} - {response.text}')
-            return None
-            
-    except Exception as e:
-        print(f'[ERROR] Exception creating {object_name}: {e}')
-        return None
-
-def query_salesforce(soql, access_token):
-    """Query Salesforce using SOQL."""
-    url = f"{SF_INSTANCE_URL}/services/data/{SF_API_VERSION}/query"
-    
-    headers = {
-        'Authorization': f'Bearer {access_token}',
-        'Content-Type': 'application/json'
-    }
-    
-    params = {'q': soql}
-    
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        
-        if response.status_code == 200:
-            result = response.json()
-            return result.get('records', [])
-        else:
-            print(f'[ERROR] Query failed: {response.status_code} - {response.text}')
-            return []
-            
-    except Exception as e:
-        print(f'[ERROR] Query exception: {e}')
-        return []
 
 # -----------------------------
 # Helper Functions
@@ -131,10 +34,49 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
         print(f"[ERROR] PDF extraction failed: {e}")
         return ""
 
+def infer_fiscal_category(context_text: str, amount: float) -> str:
+    """Infer fiscal category from surrounding text context."""
+    context_lower = context_text.lower()
+    
+    # Check for staffing indicators
+    staffing_keywords = ['fte', 'full-time equivalent', 'employees', 'staff', 'personnel', 'headcount']
+    if any(keyword in context_lower for keyword in staffing_keywords):
+        return 'Staffing'
+    
+    # Check for revenue indicators (positive amounts)
+    revenue_keywords = ['revenue', 'income', 'receipts', 'collections', 'gain']
+    if any(keyword in context_lower for keyword in revenue_keywords):
+        return 'Revenue'
+    
+    # Check for savings
+    savings_keywords = ['savings', 'reduction', 'decrease', 'efficiency']
+    if any(keyword in context_lower for keyword in savings_keywords):
+        return 'Savings'
+    
+    # Default to Expense for costs
+    return 'Expense'
+
+def infer_impact_type(context_text: str, year: str) -> str:
+    """Infer if impact is one-time or recurring."""
+    context_lower = context_text.lower()
+    
+    # One-time indicators
+    onetime_keywords = ['one-time', 'initial', 'startup', 'implementation', 'first year only']
+    if any(keyword in context_lower for keyword in onetime_keywords):
+        return 'One-time'
+    
+    # Recurring indicators
+    recurring_keywords = ['annual', 'yearly', 'ongoing', 'recurring', 'per year']
+    if any(keyword in context_lower for keyword in recurring_keywords):
+        return 'Recurring'
+    
+    # Default to Ongoing
+    return 'Ongoing'
+
 def extract_fiscal_impacts(fiscal_note_text: str) -> list:
     """
     Extract structured fiscal impact data from fiscal note text.
-    Returns list of dicts: [{"year": "2026", "amount": -88715399}, ...]
+    Returns list of dicts with full Financial_Impact__c fields.
     """
     if not fiscal_note_text:
         return []
@@ -142,10 +84,11 @@ def extract_fiscal_impacts(fiscal_note_text: str) -> list:
     impacts = []
     seen_years = set()
     
-    # Pattern: Match fiscal years with dollar amounts
-    pattern = r'(?:FY\s*)?(\d{4})[:\s]+\(?\$?([\d,]+(?:\.\d{2})?)\)?'
+    # Pattern: Match fiscal years with dollar amounts and surrounding context
+    # Captures 100 chars before and after for context
+    pattern = r'.{0,100}(?:FY\s*)?(\d{4})[:\s]+\(?\$?([\d,]+(?:\.\d{2})?)\)?.{0,100}'
     
-    matches = re.finditer(pattern, fiscal_note_text)
+    matches = re.finditer(pattern, fiscal_note_text, re.IGNORECASE)
     
     for match in matches:
         year = match.group(1)
@@ -159,18 +102,29 @@ def extract_fiscal_impacts(fiscal_note_text: str) -> list:
             continue
         
         amount_str = match.group(2).replace(',', '')
+        context_text = match.group(0)
         
         try:
             amount = float(amount_str)
             
-            # Check if it's in parentheses (negative)
-            match_text = fiscal_note_text[match.start():match.end()]
-            if '(' in match_text:
+            # Check if it's in parentheses (negative/cost)
+            if '(' in context_text and ')' in context_text:
                 amount = -amount
             
+            # Infer category and impact type from context
+            category = infer_fiscal_category(context_text, amount)
+            impact_type = infer_impact_type(context_text, year)
+            
+            # Clean up description text
+            description = context_text.strip()
+            description = re.sub(r'\s+', ' ', description)  # Normalize whitespace
+            
             impacts.append({
-                "year": year,
-                "amount": amount
+                "fiscal_year": year,
+                "amount": amount,
+                "category": category,
+                "impact_type": impact_type,
+                "description": description[:500]  # Limit to 500 chars
             })
             
             seen_years.add(year)
@@ -271,8 +225,8 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Texas Bill Analyzer",
-        "version": "3.0.0",
-        "salesforce_configured": bool(SF_CLIENT_ID and SF_CLIENT_SECRET)
+        "version": "4.0.0",
+        "endpoints": ["/health", "/session", "/analyzeBill"]
     })
 
 @app.route("/session", methods=["GET"])
@@ -286,7 +240,10 @@ def get_current_session():
 
 @app.route("/analyzeBill", methods=["POST"])
 def analyze_bill():
-    """Analyze bill and return data (does NOT create Salesforce records)."""
+    """
+    Analyze bill and return structured data for Salesforce Flow to consume.
+    Flow will create all Salesforce records.
+    """
     payload = request.get_json(silent=True) or {}
     bill_number = payload.get("bill_number")
     
@@ -355,142 +312,14 @@ def analyze_bill():
         "fiscal_note_url": fiscal_url,
         "bill_text": bill_text[:3000],
         "fiscal_note_text": fiscal_text[:3000] if fiscal_text else None,
-        "fiscal_impacts": fiscal_impacts,
+        "fiscal_impacts": fiscal_impacts,  # Now includes category, impact_type, description
         "has_fiscal_note": bool(fiscal_text),
         "exists": True,
         "success": True
     })
 
-@app.route("/saveBillAnalysis", methods=["POST"])
-def save_bill_analysis():
-    """
-    NEW ENDPOINT: Analyze bill AND create all Salesforce records.
-    This is the all-in-one endpoint that does everything.
-    """
-    payload = request.get_json(silent=True) or {}
-    bill_number = payload.get("bill_number")
-    analysis_summary = payload.get("analysis_summary", "")
-    
-    print(f"[INFO] saveBillAnalysis - Request for: {bill_number}")
-    
-    if not bill_number:
-        return jsonify({"error": "bill_number is required"}), 400
-    
-    # Get Salesforce access token
-    access_token = get_salesforce_access_token()
-    
-    if not access_token:
-        return jsonify({
-            "error": "Salesforce authentication failed. Please configure SF credentials.",
-            "success": False
-        }), 500
-    
-    # Parse bill number
-    bill_type, bill_num = parse_bill_number(bill_number)
-    if not bill_type or not bill_num:
-        return jsonify({"error": "Invalid bill format"}), 400
-    
-    session = CURRENT_SESSION
-    formatted_bill_number = f"{bill_type}{bill_num}"
-    
-    # Fetch bill and fiscal data using analyzeBill logic
-    bill_url, _ = try_bill_url_patterns(bill_type, bill_num, session)
-    
-    if not bill_url:
-        return jsonify({"error": "Bill not found", "success": False}), 404
-    
-    try:
-        bill_response = requests.get(bill_url, timeout=25, verify=False)
-        bill_text = extract_text_from_pdf_bytes(bill_response.content)
-    except:
-        return jsonify({"error": "Could not fetch bill", "success": False}), 500
-    
-    # Get fiscal data
-    fiscal_impacts = []
-    fiscal_relevant = should_fetch_fiscal_note(bill_text)
-    
-    if fiscal_relevant:
-        fiscal_url, _ = try_fiscal_note_patterns(bill_type, bill_num, session)
-        if fiscal_url:
-            try:
-                fiscal_response = requests.get(fiscal_url, timeout=10, verify=False)
-                fiscal_text = extract_text_from_pdf_bytes(fiscal_response.content)
-                if fiscal_text:
-                    fiscal_impacts = extract_fiscal_impacts(fiscal_text)
-            except:
-                pass
-    
-    # STEP 1: Find or create Legislation record
-    soql = f"SELECT Id FROM Legislation__c WHERE Bill_Number__c = '{formatted_bill_number}' AND Session__c = '{session}' LIMIT 1"
-    existing_legislation = query_salesforce(soql, access_token)
-    
-    if existing_legislation:
-        legislation_id = existing_legislation[0]['Id']
-        print(f'[INFO] Found existing Legislation: {legislation_id}')
-    else:
-        legislation_data = {
-            'Bill_Number__c': formatted_bill_number,
-            'Session__c': session,
-            'Name': f"{formatted_bill_number} - {session}"
-        }
-        legislation_id = create_salesforce_record('Legislation__c', legislation_data, access_token)
-        
-        if not legislation_id:
-            return jsonify({"error": "Failed to create Legislation record", "success": False}), 500
-    
-    # STEP 2: Check if Bill Analysis already exists
-    soql = f"SELECT Id FROM Bill_Analysis__c WHERE Legislation__c = '{legislation_id}' LIMIT 1"
-    existing_analysis = query_salesforce(soql, access_token)
-    
-    if existing_analysis:
-        return jsonify({
-            "message": f"Analysis already exists for {formatted_bill_number}",
-            "success": False,
-            "duplicate": True
-        }), 200
-    
-    # STEP 3: Create Bill Analysis record
-    analysis_data = {
-        'Legislation__c': legislation_id,
-        'Analysis_Summary__c': analysis_summary[:131000] if analysis_summary else "Analysis pending",
-        'Analysis_Date__c': None  # Let Salesforce set the datetime
-    }
-    
-    bill_analysis_id = create_salesforce_record('Bill_Analysis__c', analysis_data, access_token)
-    
-    if not bill_analysis_id:
-        return jsonify({"error": "Failed to create Bill Analysis record", "success": False}), 500
-    
-    # STEP 4: Create Financial Impact records
-    created_impacts = 0
-    
-    for impact in fiscal_impacts:
-        impact_data = {
-            'Bill_Analysis__c': bill_analysis_id,
-            'Fiscal_Year__c': impact['year'],
-            'Amount__c': impact['amount'],
-            'Impact_Type__c': 'Recurring',
-            'Description__c': f"Fiscal year {impact['year']} impact: ${impact['amount']:,.2f}"
-        }
-        
-        impact_id = create_salesforce_record('Financial_Impact__c', impact_data, access_token)
-        if impact_id:
-            created_impacts += 1
-    
-    print(f'[SUCCESS] Created {created_impacts} Financial Impact records')
-    
-    # Return success
-    return jsonify({
-        "success": True,
-        "message": f"✅ Bill analysis saved for {formatted_bill_number} with {created_impacts} fiscal impact records",
-        "legislation_id": legislation_id,
-        "bill_analysis_id": bill_analysis_id,
-        "fiscal_impacts_created": created_impacts
-    })
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
-    print(f"[INFO] Starting Texas Bill Analyzer v3.0 on port {port}")
+    print(f"[INFO] Starting Texas Bill Analyzer v4.0 on port {port}")
     print(f"[INFO] Current legislative session: {CURRENT_SESSION}")
-    print(f"[INFO] Salesforce integration: {'✅ Configured' if SF_CLIENT_ID else '❌ Not configured'}")
     app.run(host="0.0.0.0", port=port)
