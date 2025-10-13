@@ -1,4 +1,4 @@
-# app.py - VERSION 5.0 WITH HEROKU MANAGED INFERENCE
+\# app.py - VERSION 5.0 WITH HEROKU MANAGED INFERENCE
 import io
 import os
 import re
@@ -50,14 +50,7 @@ def extract_fiscal_impacts_with_ai(fiscal_note_text: str) -> list:
         return extract_fiscal_impacts_regex(fiscal_note_text)
     
     try:
-        from openai import OpenAI
-        
-        # Heroku Managed Inference uses OpenAI-compatible API
-        client = OpenAI(
-            base_url=inference_url,
-            api_key=inference_key
-        )
-        
+        # Use requests directly instead of OpenAI client to avoid proxy issues
         prompt = f"""Extract fiscal impact data from this Texas legislative fiscal note.
 
 Return ONLY a valid JSON array (no markdown, no explanation):
@@ -83,14 +76,32 @@ Rules:
 Fiscal note (first 10000 chars):
 {fiscal_note_text[:10000]}"""
         
-        response = client.chat.completions.create(
-            model=inference_model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=2000
+        # Direct API call using requests
+        headers = {
+            'Authorization': f'Bearer {inference_key}',
+            'Content-Type': 'application/json'
+        }
+        
+        payload = {
+            'model': inference_model,
+            'messages': [{'role': 'user', 'content': prompt}],
+            'temperature': 0.1,
+            'max_tokens': 2000
+        }
+        
+        response = requests.post(
+            f'{inference_url}/v1/chat/completions',
+            headers=headers,
+            json=payload,
+            timeout=30
         )
         
-        response_text = response.choices[0].message.content.strip()
+        if response.status_code != 200:
+            print(f'[ERROR] API call failed: {response.status_code} - {response.text}')
+            return extract_fiscal_impacts_regex(fiscal_note_text)
+        
+        response_data = response.json()
+        response_text = response_data['choices'][0]['message']['content'].strip()
         
         # Remove markdown code blocks if present
         if response_text.startswith('```'):
