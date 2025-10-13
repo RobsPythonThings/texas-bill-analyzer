@@ -1,4 +1,4 @@
-\# app.py - VERSION 5.0 WITH HEROKU MANAGED INFERENCE
+# app.py - VERSION 5.0 WITH HEROKU MANAGED INFERENCE
 import io
 import os
 import re
