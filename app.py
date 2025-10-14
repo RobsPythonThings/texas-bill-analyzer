@@ -1,4 +1,4 @@
-# app.py - VERSION 9.0 - FORMATTED RESPONSES + REDIS CACHING + BACKGROUND JOBS
+# app.py - VERSION 9.1 - AGENTFORCE ENDPOINT + FORMATTED RESPONSES + REDIS CACHING + BACKGROUND JOBS
 import io
 import os
 import re
@@ -459,6 +459,129 @@ def should_fetch_fiscal_note(bill_text: str) -> bool:
     return any(keyword in bill_text_lower for keyword in fiscal_keywords)
 
 # -----------------------------
+# Core Analysis Logic (Shared)
+# -----------------------------
+def perform_bill_analysis(bill_number: str, session: str = None) -> dict:
+    """
+    Core bill analysis logic that can be called by multiple endpoints.
+    Returns a complete analysis dict or error dict.
+    """
+    if session is None:
+        session = CURRENT_SESSION
+    
+    bill_type, bill_num = parse_bill_number(bill_number)
+    if not bill_type or not bill_num:
+        return {
+            "error": "Invalid bill format. Use format like 'HB 150' or 'SB 2'",
+            "error_code": "INVALID_BILL_FORMAT",
+            "success": False
+        }
+    
+    formatted_bill = f"{bill_type}{bill_num}"
+    
+    # Try to find bill
+    bill_url, bill_pattern = try_bill_url_patterns(bill_type, bill_num, session)
+    
+    if not bill_url:
+        return {
+            "bill_number": formatted_bill,
+            "session": session,
+            "exists": False,
+            "success": False,
+            "error": "Bill not found in Telicon system",
+            "error_code": "BILL_NOT_FOUND"
+        }
+    
+    # Fetch bill PDF
+    try:
+        print(f"[INFO] Fetching bill from: {bill_url}")
+        bill_response = requests.get(bill_url, timeout=30, verify=False)
+        if bill_response.status_code != 200:
+            return {
+                "error": f"Failed to fetch bill (HTTP {bill_response.status_code})",
+                "error_code": "BILL_FETCH_FAILED",
+                "success": False
+            }
+    except requests.exceptions.Timeout:
+        return {
+            "error": "Bill fetch timed out",
+            "error_code": "TIMEOUT",
+            "success": False
+        }
+    except Exception as e:
+        return {
+            "error": str(e),
+            "error_code": "BILL_FETCH_ERROR",
+            "success": False
+        }
+    
+    # Extract bill text
+    bill_text = extract_text_from_pdf_bytes(bill_response.content)
+    if not bill_text:
+        return {
+            "error": "Could not extract bill text from PDF",
+            "error_code": "PDF_EXTRACTION_FAILED",
+            "success": False
+        }
+    
+    print(f"[INFO] Extracted {len(bill_text)} characters from bill")
+    
+    # Generate bill summary using Claude
+    bill_summary = generate_bill_summary(bill_text, formatted_bill)
+    
+    # Check for and process fiscal note
+    fiscal_relevant = should_fetch_fiscal_note(bill_text)
+    fiscal_url = None
+    fiscal_note_summary = ""
+    total_fiscal_impact = 0
+    
+    if fiscal_relevant:
+        fiscal_url, fiscal_pattern = try_fiscal_note_patterns(bill_type, bill_num, session)
+        
+        if fiscal_url:
+            try:
+                print(f"[INFO] Fetching fiscal note from: {fiscal_url}")
+                fiscal_response = requests.get(fiscal_url, timeout=15, verify=False)
+                if fiscal_response.status_code == 200:
+                    fiscal_text = extract_text_from_pdf_bytes(fiscal_response.content)
+                    if fiscal_text:
+                        print(f"[INFO] Extracted {len(fiscal_text)} characters from fiscal note")
+                        # Extract structured fiscal data using Claude
+                        fiscal_data = extract_fiscal_data_with_claude(fiscal_text)
+                        fiscal_note_summary = fiscal_data.get('fiscal_note_summary', '')
+                        total_fiscal_impact = fiscal_data.get('total_fiscal_impact', 0)
+            except Exception as e:
+                print(f"[WARN] Fiscal note fetch failed: {e}")
+    
+    # Generate the FORMATTED RESPONSE for Agentforce
+    formatted_response = format_complete_response(
+        formatted_bill,
+        bill_summary,
+        fiscal_note_summary,
+        total_fiscal_impact,
+        fiscal_url or "No fiscal note available"
+    )
+    
+    # Build complete result
+    result = {
+        "bill_number": formatted_bill,
+        "bill_type": bill_type,
+        "session": session,
+        "bill_url": bill_url,
+        "fiscal_note_url": fiscal_url,
+        "bill_text": bill_text[:3000],
+        "fiscal_note_summary": fiscal_note_summary,
+        "total_fiscal_impact": total_fiscal_impact,
+        "has_fiscal_note": bool(fiscal_note_summary),
+        "formatted_response": formatted_response,
+        "exists": True,
+        "success": True,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    
+    return result
+
+# -----------------------------
 # API Routes
 # -----------------------------
 @app.route("/health", methods=["GET"])
@@ -469,9 +592,10 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Texas Bill Analyzer",
-        "version": "9.0.0",
+        "version": "9.1.0",
         "features": {
             "formatted_responses": True,
+            "agentforce_endpoint": True,
             "ai_enabled": bool(INFERENCE_URL),
             "redis_caching": CACHE_ENABLED,
             "background_jobs": job_queue is not None
@@ -480,6 +604,7 @@ def health():
             "/health",
             "/session",
             "/analyzeBill",
+            "/analyzeBillForAgentforce",
             "/job/<job_id>",
             "/cache/stats",
             "/cache/invalidate"
@@ -554,13 +679,62 @@ def get_job_status(job_id):
             "error": str(e)
         }), 404
 
+@app.route("/analyzeBillForAgentforce", methods=["POST"])
+def analyze_bill_for_agentforce():
+    """
+    SIMPLIFIED ENDPOINT FOR AGENTFORCE
+    Returns ONLY the formatted natural language response.
+    No complex JSON structure - just clean text for the agent to display.
+    """
+    payload = request.get_json(silent=True) or {}
+    bill_number = payload.get("bill_number")
+    
+    print(f"[INFO] Agentforce request for: {bill_number}")
+    
+    if not bill_number:
+        return jsonify({
+            "response": "I need a bill number to analyze. Please provide a bill number like 'HB 150' or 'SB 2'.",
+            "success": False
+        }), 400
+    
+    session = CURRENT_SESSION
+    
+    # Check cache first
+    cached_result = get_cached_analysis(bill_number, session)
+    if cached_result and cached_result.get('formatted_response'):
+        print(f"[CACHE HIT - AGENTFORCE] Returning formatted response for {bill_number}")
+        return jsonify({
+            "response": cached_result['formatted_response'],
+            "success": True
+        })
+    
+    # Perform fresh analysis
+    result = perform_bill_analysis(bill_number, session)
+    
+    # Handle errors
+    if not result.get('success'):
+        error_msg = result.get('error', 'Unknown error occurred')
+        return jsonify({
+            "response": f"I encountered an issue analyzing {bill_number}: {error_msg}",
+            "success": False
+        }), 400 if result.get('error_code') == 'INVALID_BILL_FORMAT' else 500
+    
+    # Cache the full result
+    cache_analysis(bill_number, session, result)
+    
+    # Return ONLY the formatted response for Agentforce
+    print(f"[SUCCESS - AGENTFORCE] Returning formatted response for {bill_number}")
+    return jsonify({
+        "response": result['formatted_response'],
+        "success": True
+    })
+
 @app.route("/analyzeBill", methods=["POST"])
 def analyze_bill():
     """
-    Analyze bill with FORMATTED RESPONSE ready for Agentforce display.
-    
-    This is the main endpoint. It returns a formatted_response field that
-    Agentforce can display directly without any additional formatting.
+    FULL ANALYSIS ENDPOINT (Original)
+    Returns complete structured data for Salesforce records.
+    This endpoint returns ALL fields for backward compatibility.
     """
     payload = request.get_json(silent=True) or {}
     bill_number = payload.get("bill_number")
@@ -623,106 +797,15 @@ def analyze_bill():
             print(f"[ERROR] Failed to queue job: {e}")
             # Fall through to synchronous processing
     
-    # Synchronous processing
-    bill_url, bill_pattern = try_bill_url_patterns(bill_type, bill_num, session)
+    # Perform analysis
+    result = perform_bill_analysis(bill_number, session)
     
-    if not bill_url:
-        return jsonify({
-            "bill_number": formatted_bill,
-            "session": session,
-            "exists": False,
-            "success": False,
-            "error": "Bill not found in Telicon system",
-            "error_code": "BILL_NOT_FOUND"
-        }), 404
+    # Handle errors
+    if not result.get('success'):
+        return jsonify(result), 404 if result.get('error_code') == 'BILL_NOT_FOUND' else 500
     
-    # Fetch bill PDF
-    try:
-        print(f"[INFO] Fetching bill from: {bill_url}")
-        bill_response = requests.get(bill_url, timeout=30, verify=False)
-        if bill_response.status_code != 200:
-            return jsonify({
-                "error": f"Failed to fetch bill (HTTP {bill_response.status_code})",
-                "error_code": "BILL_FETCH_FAILED",
-                "success": False
-            }), 500
-    except requests.exceptions.Timeout:
-        return jsonify({
-            "error": "Bill fetch timed out",
-            "error_code": "TIMEOUT",
-            "success": False
-        }), 504
-    except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "error_code": "BILL_FETCH_ERROR",
-            "success": False
-        }), 500
-    
-    # Extract bill text
-    bill_text = extract_text_from_pdf_bytes(bill_response.content)
-    if not bill_text:
-        return jsonify({
-            "error": "Could not extract bill text from PDF",
-            "error_code": "PDF_EXTRACTION_FAILED",
-            "success": False
-        }), 500
-    
-    print(f"[INFO] Extracted {len(bill_text)} characters from bill")
-    
-    # Generate bill summary using Claude
-    bill_summary = generate_bill_summary(bill_text, formatted_bill)
-    
-    # Check for and process fiscal note
-    fiscal_relevant = should_fetch_fiscal_note(bill_text)
-    fiscal_url = None
-    fiscal_note_summary = ""
-    total_fiscal_impact = 0
-    
-    if fiscal_relevant:
-        fiscal_url, fiscal_pattern = try_fiscal_note_patterns(bill_type, bill_num, session)
-        
-        if fiscal_url:
-            try:
-                print(f"[INFO] Fetching fiscal note from: {fiscal_url}")
-                fiscal_response = requests.get(fiscal_url, timeout=15, verify=False)
-                if fiscal_response.status_code == 200:
-                    fiscal_text = extract_text_from_pdf_bytes(fiscal_response.content)
-                    if fiscal_text:
-                        print(f"[INFO] Extracted {len(fiscal_text)} characters from fiscal note")
-                        # Extract structured fiscal data using Claude
-                        fiscal_data = extract_fiscal_data_with_claude(fiscal_text)
-                        fiscal_note_summary = fiscal_data.get('fiscal_note_summary', '')
-                        total_fiscal_impact = fiscal_data.get('total_fiscal_impact', 0)
-            except Exception as e:
-                print(f"[WARN] Fiscal note fetch failed: {e}")
-    
-    # Generate the FORMATTED RESPONSE for Agentforce
-    formatted_response = format_complete_response(
-        formatted_bill,
-        bill_summary,
-        fiscal_note_summary,
-        total_fiscal_impact,
-        fiscal_url or "No fiscal note available"
-    )
-    
-    # Build complete result
-    result = {
-        "bill_number": formatted_bill,
-        "bill_type": bill_type,
-        "session": session,
-        "bill_url": bill_url,
-        "fiscal_note_url": fiscal_url,
-        "bill_text": bill_text[:3000],
-        "fiscal_note_summary": fiscal_note_summary,
-        "total_fiscal_impact": total_fiscal_impact,
-        "has_fiscal_note": bool(fiscal_note_summary),
-        "formatted_response": formatted_response,  # ⭐ THE KEY FIELD! ⭐
-        "exists": True,
-        "success": True,
-        "cache_hit": False,
-        "timestamp": datetime.utcnow().isoformat()
-    }
+    # Add cache metadata
+    result['cache_hit'] = False
     
     # Cache the result
     cache_analysis(bill_number, session, result)
@@ -732,9 +815,10 @@ def analyze_bill():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
-    print(f"[INFO] Starting Texas Bill Analyzer v9.0 on port {port}")
+    print(f"[INFO] Starting Texas Bill Analyzer v9.1 on port {port}")
     print(f"[INFO] Legislative session: {CURRENT_SESSION}")
     print(f"[INFO] AI formatting: {'Enabled' if INFERENCE_URL else 'Disabled'}")
     print(f"[INFO] Redis caching: {'Enabled' if CACHE_ENABLED else 'Disabled'}")
     print(f"[INFO] Background jobs: {'Enabled' if job_queue else 'Disabled'}")
+    print(f"[INFO] Agentforce endpoint: /analyzeBillForAgentforce")
     app.run(host="0.0.0.0", port=port)
