@@ -4,7 +4,9 @@ from redis import Redis
 from rq import Worker, Queue, Connection
 
 redis_url = os.environ.get('REDIS_URL')
-redis_conn = Redis.from_url(redis_url, ssl_cert_reqs=None, decode_responses=True)
+
+# REMOVE decode_responses=True for RQ compatibility
+redis_conn = Redis.from_url(redis_url, ssl_cert_reqs=None)  # No decode_responses!
 
 listen = ['default']
 

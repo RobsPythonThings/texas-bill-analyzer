@@ -34,21 +34,28 @@ try:
         # Handle TLS connection - Heroku Redis uses self-signed certs
         redis_client = redis.from_url(
             redis_url, 
-            decode_responses=True,
-            ssl_cert_reqs=None  # Disable SSL verification for Heroku Redis
+            decode_responses=True,  # Keep this for cache
+            ssl_cert_reqs=None
         )
-        redis_client.ping()  # Test connection
+        redis_client.ping()
         CACHE_ENABLED = True
         print('[INFO] Redis cache enabled')
 except Exception as e:
     print(f'[WARN] Redis not available: {e}')
     redis_client = None
 
-# Job Queue for background processing
+# Job Queue for background processing - SEPARATE CLIENT!
 job_queue = None
+redis_job_client = None
 if CACHE_ENABLED:
     try:
-        job_queue = Queue('default', connection=redis_client)
+        # Create separate Redis client for RQ (no decode_responses)
+        redis_job_client = redis.from_url(
+            os.environ.get('REDIS_URL'),
+            ssl_cert_reqs=None
+            # NO decode_responses!
+        )
+        job_queue = Queue('default', connection=redis_job_client)
         print('[INFO] Job queue enabled')
     except Exception as e:
         print(f'[WARN] Job queue not available: {e}')
