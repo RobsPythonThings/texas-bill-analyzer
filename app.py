@@ -1,4 +1,4 @@
-# app.py - VERSION 8.0 - REDIS CACHING + BACKGROUND JOBS FOR HUGE BILLS
+# app.py - VERSION 8.1 - REDIS CACHING + BACKGROUND JOBS (FIXED)
 import io
 import os
 import re
@@ -27,34 +27,37 @@ TELICON_BASE_URL = "https://www.telicon.com/www/TX"
 
 # Redis Configuration
 redis_client = None
+redis_job_client = None
 CACHE_ENABLED = False
 try:
     redis_url = os.environ.get('REDIS_URL')
     if redis_url:
-        # Handle TLS connection - Heroku Redis uses self-signed certs
+        # Cache client - WITH decode_responses
         redis_client = redis.from_url(
             redis_url, 
-            decode_responses=True,  # Keep this for cache
+            decode_responses=True,
             ssl_cert_reqs=None
         )
         redis_client.ping()
+        
+        # Job client - WITHOUT decode_responses (for RQ)
+        redis_job_client = redis.from_url(
+            redis_url,
+            ssl_cert_reqs=None
+            # NO decode_responses!
+        )
+        
         CACHE_ENABLED = True
         print('[INFO] Redis cache enabled')
 except Exception as e:
     print(f'[WARN] Redis not available: {e}')
     redis_client = None
+    redis_job_client = None
 
-# Job Queue for background processing - SEPARATE CLIENT!
+# Job Queue for background processing
 job_queue = None
-redis_job_client = None
-if CACHE_ENABLED:
+if CACHE_ENABLED and redis_job_client:
     try:
-        # Create separate Redis client for RQ (no decode_responses)
-        redis_job_client = redis.from_url(
-            os.environ.get('REDIS_URL'),
-            ssl_cert_reqs=None
-            # NO decode_responses!
-        )
         job_queue = Queue('default', connection=redis_job_client)
         print('[INFO] Job queue enabled')
     except Exception as e:
@@ -374,7 +377,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Texas Bill Analyzer",
-        "version": "8.0.0",
+        "version": "8.1.0",
         "endpoints": ["/health", "/session", "/analyzeBill", "/job/<job_id>", "/cache/stats", "/cache/invalidate"],
         "ai_enabled": bool(os.environ.get('INFERENCE_URL')),
         "cache": cache_stats,
@@ -416,17 +419,19 @@ def cache_invalidate():
 @app.route("/job/<job_id>", methods=["GET"])
 def get_job_status(job_id):
     """Check status of background job."""
-    if not CACHE_ENABLED or not job_queue:
+    if not CACHE_ENABLED or not job_queue or not redis_job_client:
         return jsonify({"error": "Jobs not available"}), 503
     
     try:
-        job = Job.fetch(job_id, connection=redis_client)
+        # CRITICAL FIX: Use redis_job_client (not redis_client!) for RQ jobs
+        job = Job.fetch(job_id, connection=redis_job_client)
         
         if job.is_finished:
             result = job.result
             # Cache the result
             if result and result.get('success'):
                 cache_analysis(result['bill_number'], result['session'], result)
+                print(f"[JOB COMPLETE] Cached result for {result['bill_number']}")
             return jsonify({
                 "status": "completed",
                 "result": result
@@ -442,6 +447,7 @@ def get_job_status(job_id):
                 "job_id": job_id
             })
     except Exception as e:
+        print(f"[ERROR] Job fetch failed: {e}")
         return jsonify({
             "status": "error",
             "error": str(e)
@@ -482,6 +488,7 @@ def analyze_bill():
         cached_result = get_cached_analysis(bill_number, session)
         if cached_result:
             cached_result['cache_hit'] = True
+            print(f"[CACHE HIT] Returning from cache for {bill_number}")
             return jsonify(cached_result)
     
     # Determine if this should be a background job
@@ -606,14 +613,14 @@ def analyze_bill():
     }
     
     # Cache the result
-    print(f"[SUCCESS] Analysis complete for {formatted_bill}")
+    cache_analysis(bill_number, session, result)
     
     print(f"[SUCCESS] Analysis complete for {formatted_bill}")
     return jsonify(result)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
-    print(f"[INFO] Starting Texas Bill Analyzer v8.0 on port {port}")
+    print(f"[INFO] Starting Texas Bill Analyzer v8.1 on port {port}")
     print(f"[INFO] Current legislative session: {CURRENT_SESSION}")
     print(f"[INFO] AI extraction: {'Enabled' if os.environ.get('INFERENCE_URL') else 'Disabled'}")
     print(f"[INFO] Redis caching: {'Enabled' if CACHE_ENABLED else 'Disabled'}")
