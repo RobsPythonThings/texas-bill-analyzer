@@ -1,4 +1,4 @@
-# app.py - VERSION 8.1 - REDIS CACHING + BACKGROUND JOBS (FIXED)
+# app.py - VERSION 8.2 - REDIS CACHING + BACKGROUND JOBS (FIXED)
 import io
 import os
 import re
@@ -66,12 +66,9 @@ if CACHE_ENABLED and redis_job_client:
 # -----------------------------
 # Cache Helper Functions
 # -----------------------------
-
-
 def get_cache_key(bill_number: str, session: str) -> str:
     """Generate consistent cache key for bill analysis."""
     # Normalize bill number to match formatted version (e.g., "HB 2" -> "HB00002")
-    import re
     match = re.match(r"([HS][BRJ])\s*(\d+)", bill_number.upper().strip())
     if match:
         bill_type = match.group(1)
@@ -81,6 +78,23 @@ def get_cache_key(bill_number: str, session: str) -> str:
         normalized = bill_number.upper().replace(' ', '')
     
     return f"bill_analysis:{session}:{normalized}"
+
+def get_cached_analysis(bill_number: str, session: str) -> dict:
+    """Retrieve cached analysis if available."""
+    if not CACHE_ENABLED:
+        return None
+    
+    try:
+        key = get_cache_key(bill_number, session)
+        cached = redis_client.get(key)
+        if cached:
+            result = json.loads(cached)
+            print(f"[CACHE HIT] Returning cached analysis for {bill_number}")
+            return result
+    except Exception as e:
+        print(f"[CACHE ERROR] Failed to retrieve: {e}")
+    
+    return None
 
 def cache_analysis(bill_number: str, session: str, data: dict, ttl: int = 86400):
     """
@@ -372,7 +386,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Texas Bill Analyzer",
-        "version": "8.1.0",
+        "version": "8.2.0",
         "endpoints": ["/health", "/session", "/analyzeBill", "/job/<job_id>", "/cache/stats", "/cache/invalidate"],
         "ai_enabled": bool(os.environ.get('INFERENCE_URL')),
         "cache": cache_stats,
@@ -615,7 +629,7 @@ def analyze_bill():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
-    print(f"[INFO] Starting Texas Bill Analyzer v8.1 on port {port}")
+    print(f"[INFO] Starting Texas Bill Analyzer v8.2 on port {port}")
     print(f"[INFO] Current legislative session: {CURRENT_SESSION}")
     print(f"[INFO] AI extraction: {'Enabled' if os.environ.get('INFERENCE_URL') else 'Disabled'}")
     print(f"[INFO] Redis caching: {'Enabled' if CACHE_ENABLED else 'Disabled'}")
