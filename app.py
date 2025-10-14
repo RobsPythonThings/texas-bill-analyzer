@@ -29,7 +29,12 @@ CACHE_ENABLED = False
 try:
     redis_url = os.environ.get('REDIS_URL')
     if redis_url:
-        redis_client = redis.from_url(redis_url, decode_responses=True)
+        # Handle TLS connection - Heroku Redis uses self-signed certs
+        redis_client = redis.from_url(
+            redis_url, 
+            decode_responses=True,
+            ssl_cert_reqs=None  # Disable SSL verification for Heroku Redis
+        )
         redis_client.ping()  # Test connection
         CACHE_ENABLED = True
         print('[INFO] Redis cache enabled')
