@@ -1,4 +1,4 @@
-# app.py - VERSION 8.2 - REDIS CACHING + BACKGROUND JOBS (FIXED)
+# app.py - VERSION 9.0 - FORMATTED RESPONSES + REDIS CACHING + BACKGROUND JOBS
 import io
 import os
 import re
@@ -10,8 +10,6 @@ from pdfminer.high_level import extract_text
 from datetime import datetime
 from rq import Queue
 from rq.job import Job
-
-# ADD REDIS IMPORT
 import redis
 
 # Disable SSL warnings for Telicon (uses self-signed cert)
@@ -25,10 +23,16 @@ app = Flask(__name__)
 CURRENT_SESSION = os.environ.get('TX_LEGISLATURE_SESSION', '89R')
 TELICON_BASE_URL = "https://www.telicon.com/www/TX"
 
+# Heroku Managed Inference Configuration
+INFERENCE_URL = os.environ.get('INFERENCE_URL')
+INFERENCE_KEY = os.environ.get('INFERENCE_KEY')
+INFERENCE_MODEL_ID = os.environ.get('INFERENCE_MODEL_ID')
+
 # Redis Configuration
 redis_client = None
 redis_job_client = None
 CACHE_ENABLED = False
+
 try:
     redis_url = os.environ.get('REDIS_URL')
     if redis_url:
@@ -44,7 +48,6 @@ try:
         redis_job_client = redis.from_url(
             redis_url,
             ssl_cert_reqs=None
-            # NO decode_responses!
         )
         
         CACHE_ENABLED = True
@@ -68,7 +71,6 @@ if CACHE_ENABLED and redis_job_client:
 # -----------------------------
 def get_cache_key(bill_number: str, session: str) -> str:
     """Generate consistent cache key for bill analysis."""
-    # Normalize bill number to match formatted version (e.g., "HB 2" -> "HB00002")
     match = re.match(r"([HS][BRJ])\s*(\d+)", bill_number.upper().strip())
     if match:
         bill_type = match.group(1)
@@ -97,26 +99,15 @@ def get_cached_analysis(bill_number: str, session: str) -> dict:
     return None
 
 def cache_analysis(bill_number: str, session: str, data: dict, ttl: int = 86400):
-    """
-    Store analysis in cache.
-    
-    Args:
-        bill_number: Bill number (e.g., "HB 150")
-        session: Legislative session (e.g., "89R")
-        data: Analysis result dictionary
-        ttl: Time to live in seconds (default: 24 hours)
-    """
+    """Store analysis in cache (24 hour TTL by default)."""
     if not CACHE_ENABLED:
         return
     
     try:
         key = get_cache_key(bill_number, session)
         redis_client.setex(key, ttl, json.dumps(data))
-        
-        # Track last successful analysis
         redis_client.set('last_success_timestamp', datetime.utcnow().isoformat())
         redis_client.set('last_success_bill', bill_number)
-        
         print(f"[CACHE STORED] Cached analysis for {bill_number} (TTL: {ttl}s)")
     except Exception as e:
         print(f"[CACHE ERROR] Failed to store: {e}")
@@ -152,14 +143,13 @@ def get_cache_stats() -> dict:
         return {"enabled": True, "connected": False}
 
 # -----------------------------
-# Helper Functions
+# PDF Processing Functions
 # -----------------------------
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
-    """Extract plain text from PDF bytes. Returns empty string on failure."""
+    """Extract plain text from PDF bytes."""
     try:
         with io.BytesIO(pdf_bytes) as fh:
             txt = extract_text(fh) or ""
-            # Normalize whitespace
             txt = re.sub(r"[ \t]+", " ", txt)
             txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
             return txt
@@ -171,95 +161,134 @@ def get_appropriate_text_limit(text: str) -> int:
     """Dynamically adjust text limit based on content size."""
     length = len(text)
     if length < 50000:
-        return min(length, 10000)  # Small bills: full text
+        return min(length, 10000)
     elif length < 100000:
-        return 8000  # Medium bills
+        return 8000
     elif length < 150000:
-        return 6000  # Large bills
+        return 6000
     else:
-        return 4000  # HUGE bills (HB 2) - aggressive truncation
+        return 4000
 
-def extract_fiscal_summary_with_ai(fiscal_note_text: str) -> dict:
-    """Use Claude via Heroku Managed Inference to extract fiscal summary and total."""
+# -----------------------------
+# CLAUDE FORMATTING FUNCTIONS (THE MAGIC!)
+# -----------------------------
+def generate_bill_summary(bill_text: str, bill_number: str) -> str:
+    """
+    Use Claude to generate a concise 2-3 sentence bill summary.
+    This is separate from the fiscal analysis.
+    """
+    if not all([INFERENCE_URL, INFERENCE_KEY, INFERENCE_MODEL_ID]):
+        # Fallback: extract first meaningful sentence
+        sentences = bill_text[:500].split('.')
+        return sentences[0] if sentences else "Bill analysis unavailable."
+    
+    try:
+        prompt = f"""Summarize this Texas legislative bill in 2-3 clear sentences for a general audience.
+
+Focus on WHAT the bill does and WHO it affects. Use plain language, no legal jargon.
+
+Bill {bill_number}:
+{bill_text[:2000]}
+
+Provide ONLY the summary, no preamble."""
+
+        headers = {
+            'Authorization': f'Bearer {INFERENCE_KEY}',
+            'Content-Type': 'application/json'
+        }
+        
+        payload = {
+            'model': INFERENCE_MODEL_ID,
+            'messages': [{'role': 'user', 'content': prompt}],
+            'temperature': 0.3,
+            'max_tokens': 200
+        }
+        
+        response = requests.post(
+            f'{INFERENCE_URL}/v1/chat/completions',
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            response_data = response.json()
+            summary = response_data['choices'][0]['message']['content'].strip()
+            print(f'[SUCCESS] Generated bill summary for {bill_number}')
+            return summary
+        else:
+            print(f'[WARN] Summary generation failed: {response.status_code}')
+            return f"Analysis of {bill_number} relating to Texas legislation."
+            
+    except Exception as e:
+        print(f'[ERROR] Bill summary generation failed: {e}')
+        return f"Analysis of {bill_number} relating to Texas legislation."
+
+def extract_fiscal_data_with_claude(fiscal_note_text: str) -> dict:
+    """
+    Use Claude to extract structured fiscal data from the fiscal note.
+    Returns fiscal_note_summary (3 paragraphs) and total_fiscal_impact (number).
+    """
     if not fiscal_note_text:
         return {"fiscal_note_summary": "", "total_fiscal_impact": 0}
     
-    # Check if Heroku Managed Inference is configured
-    inference_url = os.environ.get('INFERENCE_URL')
-    inference_key = os.environ.get('INFERENCE_KEY')
-    inference_model = os.environ.get('INFERENCE_MODEL_ID')
-    
-    if not all([inference_url, inference_key, inference_model]):
-        print('[WARN] Heroku Managed Inference not configured, using fallback')
+    if not all([INFERENCE_URL, INFERENCE_KEY, INFERENCE_MODEL_ID]):
+        print('[WARN] Heroku Managed Inference not configured')
         return {
             "fiscal_note_summary": fiscal_note_text[:3000],
             "total_fiscal_impact": 0
         }
     
     try:
-        # ENHANCED PROMPT - More structured and specific
         text_limit = get_appropriate_text_limit(fiscal_note_text)
         
-        prompt = f"""Analyze this Texas legislative fiscal note and provide a comprehensive summary.
+        prompt = f"""Analyze this Texas legislative fiscal note and extract structured data.
 
-Return ONLY valid JSON (no markdown, no code blocks, no explanation):
+Return ONLY valid JSON (no markdown, no code blocks):
 {{
-  "fiscal_note_summary": "Your summary here",
+  "fiscal_note_summary": "Your 3-paragraph summary here",
   "total_fiscal_impact": -1234567.89
 }}
 
-SUMMARY REQUIREMENTS (2-3 paragraphs):
+PARAGRAPH 1 - OVERVIEW (2-3 sentences):
+State the total net fiscal impact as a single number (e.g., "$20.51 billion over five years"). Indicate if this is significant, moderate, or minimal. Note if analysis uses dynamic or static scoring methodology.
 
-Paragraph 1 - Overview:
-- State the total net fiscal impact (positive for revenue/savings, negative for costs)
-- Indicate whether impact is significant, moderate, or minimal
-- Mention if methodology is dynamic or static scoring (if stated)
+PARAGRAPH 2 - BREAKDOWN (3-4 sentences):
+List specific amounts for each fiscal year (e.g., "FY2026: -$4.11B, FY2027: -$4.43B"). Break down by fund type (General Revenue, Foundation School Fund, Federal Funds). Distinguish one-time vs recurring costs.
 
-Paragraph 2 - Year-by-Year Breakdown:
-- List specific amounts for each fiscal year (e.g., "FY2026: -$50.2M, FY2027: -$48.9M")
-- Break down by fund type (General Revenue, Federal Funds, Special Funds, etc.)
-- Distinguish between one-time and recurring costs
-
-Paragraph 3 - Implementation Details:
-- Staffing requirements: Number of FTEs and their annual costs
-- Implementation timeline and milestones
-- Any notable assumptions or contingencies
-- Long-term sustainability considerations
+PARAGRAPH 3 - IMPLEMENTATION (2-3 sentences):
+Detail staffing (number of FTEs and annual costs). Describe implementation timeline. Note key assumptions or contingencies.
 
 TOTAL FISCAL IMPACT RULES:
-- Sum ALL fiscal years mentioned in the note
-- Use NEGATIVE numbers for costs/expenses (-1234567.89)
-- Use POSITIVE numbers for revenue/savings (1234567.89)
-- If no clear total, calculate from year-by-year data
-- Include both one-time and recurring amounts
+- Sum ALL fiscal years
+- NEGATIVE for costs/expenses (-20510265653.00)
+- POSITIVE for revenue/savings (1234567.89)
+- Calculate from year-by-year if no total given
 
-Be specific with dollar amounts and fiscal years. Use clear, professional language suitable for legislators.
-
-Fiscal Note Text (first {text_limit} characters):
+Fiscal Note Text (first {text_limit} chars):
 {fiscal_note_text[:text_limit]}"""
         
-        # Direct API call using requests
         headers = {
-            'Authorization': f'Bearer {inference_key}',
+            'Authorization': f'Bearer {INFERENCE_KEY}',
             'Content-Type': 'application/json'
         }
         
         payload = {
-            'model': inference_model,
+            'model': INFERENCE_MODEL_ID,
             'messages': [{'role': 'user', 'content': prompt}],
             'temperature': 0.1,
-            'max_tokens': 2500  # Increased for detailed summaries
+            'max_tokens': 2500
         }
         
         response = requests.post(
-            f'{inference_url}/v1/chat/completions',
+            f'{INFERENCE_URL}/v1/chat/completions',
             headers=headers,
             json=payload,
-            timeout=45  # Increased timeout for complex analyses
+            timeout=60
         )
         
         if response.status_code != 200:
-            print(f'[ERROR] API call failed: {response.status_code} - {response.text}')
+            print(f'[ERROR] Fiscal extraction failed: {response.status_code}')
             return {
                 "fiscal_note_summary": fiscal_note_text[:3000],
                 "total_fiscal_impact": 0
@@ -268,7 +297,7 @@ Fiscal Note Text (first {text_limit} characters):
         response_data = response.json()
         response_text = response_data['choices'][0]['message']['content'].strip()
         
-        # Remove markdown code blocks if present
+        # Clean markdown if present
         if response_text.startswith('```'):
             lines = response_text.split('\n')
             response_text = '\n'.join(lines[1:-1]) if len(lines) > 2 else response_text
@@ -276,24 +305,78 @@ Fiscal Note Text (first {text_limit} characters):
                 response_text = response_text[4:].strip()
         
         result = json.loads(response_text)
-        
-        print(f'[SUCCESS] Claude generated fiscal summary and total: ${result.get("total_fiscal_impact", 0):,.2f}')
+        print(f'[SUCCESS] Extracted fiscal data: ${result.get("total_fiscal_impact", 0):,.2f}')
         return result
         
     except json.JSONDecodeError as e:
         print(f'[ERROR] JSON parsing failed: {e}')
-        print(f'[ERROR] Response text: {response_text[:500]}')
         return {
             "fiscal_note_summary": fiscal_note_text[:3000],
             "total_fiscal_impact": 0
         }
     except Exception as e:
-        print(f'[ERROR] AI extraction failed: {e}')
+        print(f'[ERROR] Fiscal extraction failed: {e}')
         return {
             "fiscal_note_summary": fiscal_note_text[:3000],
             "total_fiscal_impact": 0
         }
 
+def format_complete_response(
+    bill_number: str,
+    bill_summary: str,
+    fiscal_note_summary: str,
+    total_fiscal_impact: float,
+    fiscal_note_url: str
+) -> str:
+    """
+    Format the COMPLETE response that Agentforce will display.
+    This is the KEY function - it gives you total control over formatting!
+    """
+    
+    # Format the fiscal impact as currency
+    if total_fiscal_impact < 0:
+        impact_str = f"USD -${abs(total_fiscal_impact):,.2f}"
+        if abs(total_fiscal_impact) >= 1_000_000_000:
+            impact_short = f"USD -${abs(total_fiscal_impact)/1_000_000_000:.2f} billion"
+        elif abs(total_fiscal_impact) >= 1_000_000:
+            impact_short = f"USD -${abs(total_fiscal_impact)/1_000_000:.2f} million"
+        else:
+            impact_short = impact_str
+    elif total_fiscal_impact > 0:
+        impact_str = f"USD +${total_fiscal_impact:,.2f}"
+        if total_fiscal_impact >= 1_000_000_000:
+            impact_short = f"USD +${total_fiscal_impact/1_000_000_000:.2f} billion"
+        elif total_fiscal_impact >= 1_000_000:
+            impact_short = f"USD +${total_fiscal_impact/1_000_000:.2f} million"
+        else:
+            impact_short = impact_str
+    else:
+        impact_str = "No fiscal impact identified"
+        impact_short = impact_str
+    
+    # Build the formatted response
+    if fiscal_note_summary:
+        formatted = f"""Analysis: {bill_summary}
+
+Fiscal Impact: {fiscal_note_summary}
+
+Total Fiscal Impact: {impact_short}
+
+You can review the full fiscal note here: {fiscal_note_url}
+
+Would you like to track this bill and save it to Salesforce?"""
+    else:
+        formatted = f"""Analysis: {bill_summary}
+
+Fiscal Impact: No fiscal analysis is currently available for this bill.
+
+Would you like to track this bill and save it to Salesforce?"""
+    
+    return formatted
+
+# -----------------------------
+# Bill Lookup Functions
+# -----------------------------
 def parse_bill_number(bill_number: str) -> tuple:
     """Parse bill number into (bill_type, bill_num)."""
     match = re.match(r"([HS][BRJ])\s*(\d+)", bill_number.upper().strip())
@@ -329,7 +412,7 @@ def try_bill_url_patterns(bill_type: str, bill_num: str, session: str) -> tuple:
         try:
             response = requests.head(pattern["url"], timeout=5, verify=False)
             if response.status_code == 200:
-                print(f"[SUCCESS] Found bill using {pattern['type']}: {pattern['url']}")
+                print(f"[SUCCESS] Found bill using {pattern['type']}")
                 return pattern["url"], pattern["type"]
         except:
             continue
@@ -357,7 +440,7 @@ def try_fiscal_note_patterns(bill_type: str, bill_num: str, session: str) -> tup
         try:
             response = requests.head(pattern["url"], timeout=5, verify=False)
             if response.status_code == 200:
-                print(f"[SUCCESS] Found fiscal note using {pattern['type']}: {pattern['url']}")
+                print(f"[SUCCESS] Found fiscal note using {pattern['type']}")
                 return pattern["url"], pattern["type"]
         except:
             continue
@@ -380,17 +463,28 @@ def should_fetch_fiscal_note(bill_text: str) -> bool:
 # -----------------------------
 @app.route("/health", methods=["GET"])
 def health():
-    """Enhanced health check with cache status."""
+    """Health check with full system status."""
     cache_stats = get_cache_stats()
     
     return jsonify({
         "ok": True,
         "service": "Texas Bill Analyzer",
-        "version": "8.2.0",
-        "endpoints": ["/health", "/session", "/analyzeBill", "/job/<job_id>", "/cache/stats", "/cache/invalidate"],
-        "ai_enabled": bool(os.environ.get('INFERENCE_URL')),
-        "cache": cache_stats,
-        "job_queue_enabled": job_queue is not None,
+        "version": "9.0.0",
+        "features": {
+            "formatted_responses": True,
+            "ai_enabled": bool(INFERENCE_URL),
+            "redis_caching": CACHE_ENABLED,
+            "background_jobs": job_queue is not None
+        },
+        "endpoints": [
+            "/health",
+            "/session",
+            "/analyzeBill",
+            "/job/<job_id>",
+            "/cache/stats",
+            "/cache/invalidate"
+        ],
+        "cache_stats": cache_stats,
         "heroku_slug": os.environ.get('HEROKU_SLUG_COMMIT', 'unknown')[:7]
     })
 
@@ -432,12 +526,10 @@ def get_job_status(job_id):
         return jsonify({"error": "Jobs not available"}), 503
     
     try:
-        # CRITICAL FIX: Use redis_job_client (not redis_client!) for RQ jobs
         job = Job.fetch(job_id, connection=redis_job_client)
         
         if job.is_finished:
             result = job.result
-            # Cache the result
             if result and result.get('success'):
                 cache_analysis(result['bill_number'], result['session'], result)
                 print(f"[JOB COMPLETE] Cached result for {result['bill_number']}")
@@ -465,7 +557,10 @@ def get_job_status(job_id):
 @app.route("/analyzeBill", methods=["POST"])
 def analyze_bill():
     """
-    Analyze bill - use background job for huge bills to avoid timeout.
+    Analyze bill with FORMATTED RESPONSE ready for Agentforce display.
+    
+    This is the main endpoint. It returns a formatted_response field that
+    Agentforce can display directly without any additional formatting.
     """
     payload = request.get_json(silent=True) or {}
     bill_number = payload.get("bill_number")
@@ -501,19 +596,17 @@ def analyze_bill():
             return jsonify(cached_result)
     
     # Determine if this should be a background job
-    # Known huge bills that timeout
     huge_bills = ['HB00002', 'SB00001', 'HB00001']
     should_async = use_async or (formatted_bill in huge_bills)
     
     if should_async and job_queue:
-        # Queue background job
         from tasks import analyze_bill_task
         try:
             job = job_queue.enqueue(
                 analyze_bill_task,
                 bill_number,
                 session,
-                job_timeout='10m'  # 10 minute max
+                job_timeout='10m'
             )
             
             print(f"[ASYNC] Queued background job {job.id} for {formatted_bill}")
@@ -530,20 +623,18 @@ def analyze_bill():
             print(f"[ERROR] Failed to queue job: {e}")
             # Fall through to synchronous processing
     
-    # Synchronous processing for normal bills
-    # Try to find bill
+    # Synchronous processing
     bill_url, bill_pattern = try_bill_url_patterns(bill_type, bill_num, session)
     
     if not bill_url:
-        error_response = {
+        return jsonify({
             "bill_number": formatted_bill,
             "session": session,
             "exists": False,
             "success": False,
             "error": "Bill not found in Telicon system",
             "error_code": "BILL_NOT_FOUND"
-        }
-        return jsonify(error_response), 404
+        }), 404
     
     # Fetch bill PDF
     try:
@@ -577,11 +668,13 @@ def analyze_bill():
             "success": False
         }), 500
     
-    print(f"[INFO] analyzeBill - Extracted {len(bill_text)} characters")
+    print(f"[INFO] Extracted {len(bill_text)} characters from bill")
     
-    # Check for fiscal note
+    # Generate bill summary using Claude
+    bill_summary = generate_bill_summary(bill_text, formatted_bill)
+    
+    # Check for and process fiscal note
     fiscal_relevant = should_fetch_fiscal_note(bill_text)
-    fiscal_text = None
     fiscal_url = None
     fiscal_note_summary = ""
     total_fiscal_impact = 0
@@ -596,25 +689,35 @@ def analyze_bill():
                 if fiscal_response.status_code == 200:
                     fiscal_text = extract_text_from_pdf_bytes(fiscal_response.content)
                     if fiscal_text:
-                        print(f"[INFO] analyzeBill - Fiscal note found: {len(fiscal_text)} characters")
-                        # Get summary and total from Claude
-                        fiscal_data = extract_fiscal_summary_with_ai(fiscal_text)
+                        print(f"[INFO] Extracted {len(fiscal_text)} characters from fiscal note")
+                        # Extract structured fiscal data using Claude
+                        fiscal_data = extract_fiscal_data_with_claude(fiscal_text)
                         fiscal_note_summary = fiscal_data.get('fiscal_note_summary', '')
                         total_fiscal_impact = fiscal_data.get('total_fiscal_impact', 0)
             except Exception as e:
                 print(f"[WARN] Fiscal note fetch failed: {e}")
     
-    # Build result
+    # Generate the FORMATTED RESPONSE for Agentforce
+    formatted_response = format_complete_response(
+        formatted_bill,
+        bill_summary,
+        fiscal_note_summary,
+        total_fiscal_impact,
+        fiscal_url or "No fiscal note available"
+    )
+    
+    # Build complete result
     result = {
         "bill_number": formatted_bill,
         "bill_type": bill_type,
         "session": session,
         "bill_url": bill_url,
         "fiscal_note_url": fiscal_url,
-        "bill_text": bill_text[:3000],  # First 3000 chars for Flow
+        "bill_text": bill_text[:3000],
         "fiscal_note_summary": fiscal_note_summary,
         "total_fiscal_impact": total_fiscal_impact,
-        "has_fiscal_note": bool(fiscal_text),
+        "has_fiscal_note": bool(fiscal_note_summary),
+        "formatted_response": formatted_response,  # ⭐ THE KEY FIELD! ⭐
         "exists": True,
         "success": True,
         "cache_hit": False,
@@ -629,9 +732,9 @@ def analyze_bill():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
-    print(f"[INFO] Starting Texas Bill Analyzer v8.2 on port {port}")
-    print(f"[INFO] Current legislative session: {CURRENT_SESSION}")
-    print(f"[INFO] AI extraction: {'Enabled' if os.environ.get('INFERENCE_URL') else 'Disabled'}")
+    print(f"[INFO] Starting Texas Bill Analyzer v9.0 on port {port}")
+    print(f"[INFO] Legislative session: {CURRENT_SESSION}")
+    print(f"[INFO] AI formatting: {'Enabled' if INFERENCE_URL else 'Disabled'}")
     print(f"[INFO] Redis caching: {'Enabled' if CACHE_ENABLED else 'Disabled'}")
-    print(f"[INFO] Job queue: {'Enabled' if job_queue else 'Disabled'}")
+    print(f"[INFO] Background jobs: {'Enabled' if job_queue else 'Disabled'}")
     app.run(host="0.0.0.0", port=port)
