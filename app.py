@@ -1,4 +1,4 @@
-# app.py - VERSION 7.0 - REDIS CACHING + ENHANCED FISCAL ANALYSIS
+# app.py - VERSION 8.0 - REDIS CACHING + BACKGROUND JOBS FOR HUGE BILLS
 import io
 import os
 import re
@@ -8,6 +8,8 @@ from flask import Flask, request, jsonify
 import requests
 from pdfminer.high_level import extract_text
 from datetime import datetime
+from rq import Queue
+from rq.job import Job
 
 # ADD REDIS IMPORT
 import redis
@@ -41,6 +43,15 @@ try:
 except Exception as e:
     print(f'[WARN] Redis not available: {e}')
     redis_client = None
+
+# Job Queue for background processing
+job_queue = None
+if CACHE_ENABLED:
+    try:
+        job_queue = Queue('default', connection=redis_client)
+        print('[INFO] Job queue enabled')
+    except Exception as e:
+        print(f'[WARN] Job queue not available: {e}')
 
 # -----------------------------
 # Cache Helper Functions
@@ -141,11 +152,13 @@ def get_appropriate_text_limit(text: str) -> int:
     """Dynamically adjust text limit based on content size."""
     length = len(text)
     if length < 50000:
-        return min(length, 10000)  # Small bills: up to 10k chars
+        return min(length, 10000)  # Small bills: full text
     elif length < 100000:
-        return 10000  # Medium bills: 10k chars
+        return 8000  # Medium bills
+    elif length < 150000:
+        return 6000  # Large bills
     else:
-        return 8000  # Large bills: 8k chars (prevent timeout)
+        return 4000  # HUGE bills (HB 2) - aggressive truncation
 
 def extract_fiscal_summary_with_ai(fiscal_note_text: str) -> dict:
     """Use Claude via Heroku Managed Inference to extract fiscal summary and total."""
@@ -354,10 +367,11 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Texas Bill Analyzer",
-        "version": "7.0.0",
-        "endpoints": ["/health", "/session", "/analyzeBill", "/cache/stats", "/cache/invalidate"],
+        "version": "8.0.0",
+        "endpoints": ["/health", "/session", "/analyzeBill", "/job/<job_id>", "/cache/stats", "/cache/invalidate"],
         "ai_enabled": bool(os.environ.get('INFERENCE_URL')),
         "cache": cache_stats,
+        "job_queue_enabled": job_queue is not None,
         "heroku_slug": os.environ.get('HEROKU_SLUG_COMMIT', 'unknown')[:7]
     })
 
@@ -392,15 +406,49 @@ def cache_invalidate():
         "message": f"Cache invalidated for {bill_number}"
     })
 
+@app.route("/job/<job_id>", methods=["GET"])
+def get_job_status(job_id):
+    """Check status of background job."""
+    if not CACHE_ENABLED or not job_queue:
+        return jsonify({"error": "Jobs not available"}), 503
+    
+    try:
+        job = Job.fetch(job_id, connection=redis_client)
+        
+        if job.is_finished:
+            result = job.result
+            # Cache the result
+            if result and result.get('success'):
+                cache_analysis(result['bill_number'], result['session'], result)
+            return jsonify({
+                "status": "completed",
+                "result": result
+            })
+        elif job.is_failed:
+            return jsonify({
+                "status": "failed",
+                "error": str(job.exc_info)
+            })
+        else:
+            return jsonify({
+                "status": "processing",
+                "job_id": job_id
+            })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e)
+        }), 404
+
 @app.route("/analyzeBill", methods=["POST"])
 def analyze_bill():
     """
-    Analyze bill and return structured data for Salesforce Flow to consume.
-    NOW WITH REDIS CACHING!
+    Analyze bill - use background job for huge bills to avoid timeout.
     """
     payload = request.get_json(silent=True) or {}
     bill_number = payload.get("bill_number")
-    force_refresh = payload.get("force_refresh", False)  # Allow cache bypass
+    force_refresh = payload.get("force_refresh", False)
+    use_async = payload.get("use_async", False)
     
     print(f"[INFO] analyzeBill - Request for: {bill_number}")
     
@@ -422,14 +470,44 @@ def analyze_bill():
     session = CURRENT_SESSION
     formatted_bill = f"{bill_type}{bill_num}"
     
-    # ===== CHECK CACHE FIRST (unless force_refresh) =====
+    # Check cache first
     if not force_refresh:
         cached_result = get_cached_analysis(bill_number, session)
         if cached_result:
             cached_result['cache_hit'] = True
             return jsonify(cached_result)
-    # ===================================================
     
+    # Determine if this should be a background job
+    # Known huge bills that timeout
+    huge_bills = ['HB00002', 'SB00001', 'HB00001']
+    should_async = use_async or (formatted_bill in huge_bills)
+    
+    if should_async and job_queue:
+        # Queue background job
+        from tasks import analyze_bill_task
+        try:
+            job = job_queue.enqueue(
+                analyze_bill_task,
+                bill_number,
+                session,
+                job_timeout='10m'  # 10 minute max
+            )
+            
+            print(f"[ASYNC] Queued background job {job.id} for {formatted_bill}")
+            
+            return jsonify({
+                "job_id": job.id,
+                "status": "processing",
+                "bill_number": formatted_bill,
+                "check_url": f"/job/{job.id}",
+                "message": "Large bill queued for background processing. Check status at /job/{job_id}",
+                "success": True
+            }), 202
+        except Exception as e:
+            print(f"[ERROR] Failed to queue job: {e}")
+            # Fall through to synchronous processing
+    
+    # Synchronous processing for normal bills
     # Try to find bill
     bill_url, bill_pattern = try_bill_url_patterns(bill_type, bill_num, session)
     
@@ -520,17 +598,17 @@ def analyze_bill():
         "timestamp": datetime.utcnow().isoformat()
     }
     
-    # ===== CACHE THE RESULT =====
-    cache_analysis(bill_number, session, result)
-    # ============================
+    # Cache the result
+    print(f"[SUCCESS] Analysis complete for {formatted_bill}")
     
     print(f"[SUCCESS] Analysis complete for {formatted_bill}")
     return jsonify(result)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
-    print(f"[INFO] Starting Texas Bill Analyzer v7.0 on port {port}")
+    print(f"[INFO] Starting Texas Bill Analyzer v8.0 on port {port}")
     print(f"[INFO] Current legislative session: {CURRENT_SESSION}")
     print(f"[INFO] AI extraction: {'Enabled' if os.environ.get('INFERENCE_URL') else 'Disabled'}")
     print(f"[INFO] Redis caching: {'Enabled' if CACHE_ENABLED else 'Disabled'}")
+    print(f"[INFO] Job queue: {'Enabled' if job_queue else 'Disabled'}")
     app.run(host="0.0.0.0", port=port)

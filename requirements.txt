@@ -2,5 +2,6 @@ Flask==2.3.0
 requests==2.31.0
 pdfminer.six==20221105
 redis==5.0.1
+rq==1.16.2
 gunicorn==21.2.0
 urllib3==2.0.0
