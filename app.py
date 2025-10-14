@@ -66,26 +66,21 @@ if CACHE_ENABLED and redis_job_client:
 # -----------------------------
 # Cache Helper Functions
 # -----------------------------
+
+
 def get_cache_key(bill_number: str, session: str) -> str:
     """Generate consistent cache key for bill analysis."""
-    return f"bill_analysis:{session}:{bill_number.upper().replace(' ', '')}"
-
-def get_cached_analysis(bill_number: str, session: str) -> dict:
-    """Retrieve cached analysis if available."""
-    if not CACHE_ENABLED:
-        return None
+    # Normalize bill number to match formatted version (e.g., "HB 2" -> "HB00002")
+    import re
+    match = re.match(r"([HS][BRJ])\s*(\d+)", bill_number.upper().strip())
+    if match:
+        bill_type = match.group(1)
+        bill_num = match.group(2).zfill(5)
+        normalized = f"{bill_type}{bill_num}"
+    else:
+        normalized = bill_number.upper().replace(' ', '')
     
-    try:
-        key = get_cache_key(bill_number, session)
-        cached = redis_client.get(key)
-        if cached:
-            result = json.loads(cached)
-            print(f"[CACHE HIT] Returning cached analysis for {bill_number}")
-            return result
-    except Exception as e:
-        print(f"[CACHE ERROR] Failed to retrieve: {e}")
-    
-    return None
+    return f"bill_analysis:{session}:{normalized}"
 
 def cache_analysis(bill_number: str, session: str, data: dict, ttl: int = 86400):
     """
