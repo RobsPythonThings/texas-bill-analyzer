@@ -1,4 +1,4 @@
-# app.py - VERSION 5.0 WITH HEROKU MANAGED INFERENCE
+# app.py - VERSION 6.0 - SIMPLIFIED FISCAL ANALYSIS
 import io
 import os
 import re
@@ -35,10 +35,10 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
         print(f"[ERROR] PDF extraction failed: {e}")
         return ""
 
-def extract_fiscal_impacts_with_ai(fiscal_note_text: str) -> list:
-    """Use Claude via Heroku Managed Inference to extract structured fiscal data."""
+def extract_fiscal_summary_with_ai(fiscal_note_text: str) -> dict:
+    """Use Claude via Heroku Managed Inference to extract fiscal summary and total."""
     if not fiscal_note_text:
-        return []
+        return {"fiscal_note_summary": "", "total_fiscal_impact": 0}
     
     # Check if Heroku Managed Inference is configured
     inference_url = os.environ.get('INFERENCE_URL')
@@ -46,34 +46,38 @@ def extract_fiscal_impacts_with_ai(fiscal_note_text: str) -> list:
     inference_model = os.environ.get('INFERENCE_MODEL_ID')
     
     if not all([inference_url, inference_key, inference_model]):
-        print('[WARN] Heroku Managed Inference not configured, using fallback regex')
-        return extract_fiscal_impacts_regex(fiscal_note_text)
+        print('[WARN] Heroku Managed Inference not configured, using fallback')
+        return {
+            "fiscal_note_summary": fiscal_note_text[:3000],
+            "total_fiscal_impact": 0
+        }
     
     try:
-        # Use requests directly instead of OpenAI client to avoid proxy issues
-        prompt = f"""Extract fiscal impact data from this Texas legislative fiscal note.
+        # Updated prompt for summary + total
+        prompt = f"""Analyze this Texas legislative fiscal note and provide a comprehensive summary with total fiscal impact.
 
-Return ONLY a valid JSON array (no markdown, no explanation):
-[
-  {{
-    "fiscal_year": "2026",
-    "amount": -88715399.00,
-    "category": "Expense",
-    "impact_type": "Recurring",
-    "description": "General Revenue Fund decrease for implementation"
-  }}
-]
+Return ONLY valid JSON (no markdown, no explanation):
+{{
+  "fiscal_note_summary": "A clear 2-3 paragraph summary of the fiscal impacts",
+  "total_fiscal_impact": -1258000.00
+}}
 
-Rules:
-- fiscal_year: 4-digit year as string
-- amount: negative for costs, positive for revenue
-- category: "Expense", "Revenue", "Staffing", "Savings", or "Other"
-- impact_type: "One-time", "Recurring", or "Ongoing"
-- description: max 200 chars
-- Extract ALL fiscal years mentioned
-- If FTE/staffing mentioned, add separate "Staffing" entry
+Instructions:
+- fiscal_note_summary: Write a clear narrative explaining all fiscal impacts, including:
+  * Specific dollar amounts for each fiscal year
+  * Categories (General Revenue, Special Funds, etc.)
+  * One-time vs recurring costs
+  * Staffing needs (FTEs) if mentioned
+  * Timeline (which years are affected)
+  * Make it readable for legislators and staff
+- total_fiscal_impact: Calculate the NET TOTAL of all fiscal impacts across all years mentioned
+  * Use negative numbers for costs/expenses to the state
+  * Use positive numbers for revenue/savings to the state
+  * Sum ALL years mentioned in the fiscal note
+- Be specific with amounts and years
+- Keep summary concise but comprehensive (2-3 paragraphs max)
 
-Fiscal note (first 10000 chars):
+Fiscal note text:
 {fiscal_note_text[:10000]}"""
         
         # Direct API call using requests
@@ -98,7 +102,10 @@ Fiscal note (first 10000 chars):
         
         if response.status_code != 200:
             print(f'[ERROR] API call failed: {response.status_code} - {response.text}')
-            return extract_fiscal_impacts_regex(fiscal_note_text)
+            return {
+                "fiscal_note_summary": fiscal_note_text[:3000],
+                "total_fiscal_impact": 0
+            }
         
         response_data = response.json()
         response_text = response_data['choices'][0]['message']['content'].strip()
@@ -110,116 +117,18 @@ Fiscal note (first 10000 chars):
             if response_text.startswith('json'):
                 response_text = response_text[4:].strip()
         
-        impacts = json.loads(response_text)
+        result = json.loads(response_text)
         
-        print(f'[SUCCESS] Claude extracted {len(impacts)} fiscal impacts')
-        return impacts
+        print(f'[SUCCESS] Claude generated fiscal summary and total: ${result.get("total_fiscal_impact", 0):,.2f}')
+        return result
         
     except Exception as e:
         print(f'[ERROR] AI extraction failed: {e}')
-        print(f'[ERROR] Falling back to regex extraction')
-        return extract_fiscal_impacts_regex(fiscal_note_text)
-
-def infer_fiscal_category(context_text: str, amount: float) -> str:
-    """Infer fiscal category from surrounding text context."""
-    context_lower = context_text.lower()
-    
-    # Check for staffing indicators
-    staffing_keywords = ['fte', 'full-time equivalent', 'employees', 'staff', 'personnel', 'headcount']
-    if any(keyword in context_lower for keyword in staffing_keywords):
-        return 'Staffing'
-    
-    # Check for revenue indicators (positive amounts)
-    revenue_keywords = ['revenue', 'income', 'receipts', 'collections', 'gain']
-    if any(keyword in context_lower for keyword in revenue_keywords):
-        return 'Revenue'
-    
-    # Check for savings
-    savings_keywords = ['savings', 'reduction', 'decrease', 'efficiency']
-    if any(keyword in context_lower for keyword in savings_keywords):
-        return 'Savings'
-    
-    # Default to Expense for costs
-    return 'Expense'
-
-def infer_impact_type(context_text: str, year: str) -> str:
-    """Infer if impact is one-time or recurring."""
-    context_lower = context_text.lower()
-    
-    # One-time indicators
-    onetime_keywords = ['one-time', 'initial', 'startup', 'implementation', 'first year only']
-    if any(keyword in context_lower for keyword in onetime_keywords):
-        return 'One-time'
-    
-    # Recurring indicators
-    recurring_keywords = ['annual', 'yearly', 'ongoing', 'recurring', 'per year']
-    if any(keyword in context_lower for keyword in recurring_keywords):
-        return 'Recurring'
-    
-    # Default to Ongoing
-    return 'Ongoing'
-
-def extract_fiscal_impacts_regex(fiscal_note_text: str) -> list:
-    """
-    Fallback regex-based extraction (less reliable than AI).
-    Returns list of dicts with full Financial_Impact__c fields.
-    """
-    if not fiscal_note_text:
-        return []
-    
-    impacts = []
-    seen_years = set()
-    
-    # Pattern: Match fiscal years with dollar amounts and surrounding context
-    # Captures 100 chars before and after for context
-    pattern = r'.{0,100}(?:FY\s*)?(\d{4})[:\s]+\(?\$?([\d,]+(?:\.\d{2})?)\)?.{0,100}'
-    
-    matches = re.finditer(pattern, fiscal_note_text, re.IGNORECASE)
-    
-    for match in matches:
-        year = match.group(1)
-        
-        # Skip if not a valid fiscal year (2020-2040 range)
-        if not (2020 <= int(year) <= 2040):
-            continue
-            
-        # Skip duplicate years
-        if year in seen_years:
-            continue
-        
-        amount_str = match.group(2).replace(',', '')
-        context_text = match.group(0)
-        
-        try:
-            amount = float(amount_str)
-            
-            # Check if it's in parentheses (negative/cost)
-            if '(' in context_text and ')' in context_text:
-                amount = -amount
-            
-            # Infer category and impact type from context
-            category = infer_fiscal_category(context_text, amount)
-            impact_type = infer_impact_type(context_text, year)
-            
-            # Clean up description text
-            description = context_text.strip()
-            description = re.sub(r'\s+', ' ', description)  # Normalize whitespace
-            
-            impacts.append({
-                "fiscal_year": year,
-                "amount": amount,
-                "category": category,
-                "impact_type": impact_type,
-                "description": description[:500]  # Limit to 500 chars
-            })
-            
-            seen_years.add(year)
-            
-        except ValueError:
-            continue
-    
-    print(f"[INFO] Regex extracted {len(impacts)} fiscal impacts from fiscal note")
-    return impacts
+        print(f'[ERROR] Falling back to raw text')
+        return {
+            "fiscal_note_summary": fiscal_note_text[:3000],
+            "total_fiscal_impact": 0
+        }
 
 def parse_bill_number(bill_number: str) -> tuple:
     """Parse bill number into (bill_type, bill_num)."""
@@ -311,7 +220,7 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Texas Bill Analyzer",
-        "version": "5.0.0",
+        "version": "6.0.0",
         "endpoints": ["/health", "/session", "/analyzeBill"],
         "ai_enabled": bool(os.environ.get('INFERENCE_URL'))
     })
@@ -375,7 +284,8 @@ def analyze_bill():
     fiscal_relevant = should_fetch_fiscal_note(bill_text)
     fiscal_text = None
     fiscal_url = None
-    fiscal_impacts = []
+    fiscal_note_summary = ""
+    total_fiscal_impact = 0
     
     if fiscal_relevant:
         fiscal_url, fiscal_pattern = try_fiscal_note_patterns(bill_type, bill_num, session)
@@ -387,7 +297,10 @@ def analyze_bill():
                     fiscal_text = extract_text_from_pdf_bytes(fiscal_response.content)
                     if fiscal_text:
                         print(f"[INFO] analyzeBill - Fiscal note found: {len(fiscal_text)} characters")
-                        fiscal_impacts = extract_fiscal_impacts_with_ai(fiscal_text)
+                        # Get summary and total from Claude
+                        fiscal_data = extract_fiscal_summary_with_ai(fiscal_text)
+                        fiscal_note_summary = fiscal_data.get('fiscal_note_summary', '')
+                        total_fiscal_impact = fiscal_data.get('total_fiscal_impact', 0)
             except Exception as e:
                 print(f"[WARN] Fiscal note fetch failed: {e}")
     
@@ -398,9 +311,8 @@ def analyze_bill():
         "bill_url": bill_url,
         "fiscal_note_url": fiscal_url,
         "bill_text": bill_text[:3000],
-        "fiscal_note_text": fiscal_text[:3000] if fiscal_text else None,
-        "fiscal_impacts": fiscal_impacts,
-        "fiscal_impacts_json": json.dumps(fiscal_impacts),
+        "fiscal_note_summary": fiscal_note_summary,
+        "total_fiscal_impact": total_fiscal_impact,
         "has_fiscal_note": bool(fiscal_text),
         "exists": True,
         "success": True
@@ -408,7 +320,7 @@ def analyze_bill():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
-    print(f"[INFO] Starting Texas Bill Analyzer v5.0 on port {port}")
+    print(f"[INFO] Starting Texas Bill Analyzer v6.0 on port {port}")
     print(f"[INFO] Current legislative session: {CURRENT_SESSION}")
     print(f"[INFO] AI extraction: {'Enabled' if os.environ.get('INFERENCE_URL') else 'Disabled (using regex fallback)'}")
     app.run(host="0.0.0.0", port=port)
