@@ -1,4 +1,4 @@
-# app.py - VERSION 9.1 - AGENTFORCE ENDPOINT + FORMATTED RESPONSES + REDIS CACHING + BACKGROUND JOBS
+# app.py - VERSION 9.2 - IMPROVED PROMPTS + BETTER FORMATTING
 import io
 import os
 import re
@@ -170,12 +170,12 @@ def get_appropriate_text_limit(text: str) -> int:
         return 4000
 
 # -----------------------------
-# CLAUDE FORMATTING FUNCTIONS (THE MAGIC!)
+# CLAUDE FUNCTIONS - IMPROVED PROMPTS
 # -----------------------------
 def generate_bill_summary(bill_text: str, bill_number: str) -> str:
     """
     Use Claude to generate a concise 2-3 sentence bill summary.
-    This is separate from the fiscal analysis.
+    VERSION 9.2 - Improved prompt for clearer, more useful summaries.
     """
     if not all([INFERENCE_URL, INFERENCE_KEY, INFERENCE_MODEL_ID]):
         # Fallback: extract first meaningful sentence
@@ -183,14 +183,19 @@ def generate_bill_summary(bill_text: str, bill_number: str) -> str:
         return sentences[0] if sentences else "Bill analysis unavailable."
     
     try:
-        prompt = f"""Summarize this Texas legislative bill in 2-3 clear sentences for a general audience.
+        prompt = f"""Analyze this Texas bill and write a clear 2-3 sentence summary for a general audience.
 
-Focus on WHAT the bill does and WHO it affects. Use plain language, no legal jargon.
+Focus on:
+1. What the bill DOES (creates, modifies, funds, prohibits, requires)
+2. Who it AFFECTS (specific groups: teachers, businesses, taxpayers, etc.)
+3. Why it MATTERS (the practical impact)
+
+Avoid legal jargon. Write like you're explaining it to a friend.
 
 Bill {bill_number}:
-{bill_text[:2000]}
+{bill_text[:2500]}
 
-Provide ONLY the summary, no preamble."""
+Summary:"""
 
         headers = {
             'Authorization': f'Bearer {INFERENCE_KEY}',
@@ -201,7 +206,7 @@ Provide ONLY the summary, no preamble."""
             'model': INFERENCE_MODEL_ID,
             'messages': [{'role': 'user', 'content': prompt}],
             'temperature': 0.3,
-            'max_tokens': 200
+            'max_tokens': 250
         }
         
         response = requests.post(
@@ -214,6 +219,8 @@ Provide ONLY the summary, no preamble."""
         if response.status_code == 200:
             response_data = response.json()
             summary = response_data['choices'][0]['message']['content'].strip()
+            # Remove "Summary:" prefix if Claude includes it
+            summary = re.sub(r'^Summary:\s*', '', summary, flags=re.IGNORECASE)
             print(f'[SUCCESS] Generated bill summary for {bill_number}')
             return summary
         else:
@@ -227,7 +234,7 @@ Provide ONLY the summary, no preamble."""
 def extract_fiscal_data_with_claude(fiscal_note_text: str) -> dict:
     """
     Use Claude to extract structured fiscal data from the fiscal note.
-    Returns fiscal_note_summary (3 paragraphs) and total_fiscal_impact (number).
+    VERSION 9.2 - Improved prompt with clearer structure and instructions.
     """
     if not fiscal_note_text:
         return {"fiscal_note_summary": "", "total_fiscal_impact": 0}
@@ -242,7 +249,7 @@ def extract_fiscal_data_with_claude(fiscal_note_text: str) -> dict:
     try:
         text_limit = get_appropriate_text_limit(fiscal_note_text)
         
-        prompt = f"""Analyze this Texas legislative fiscal note and extract structured data.
+        prompt = f"""Analyze this Texas fiscal note and extract key financial data.
 
 Return ONLY valid JSON (no markdown, no code blocks):
 {{
@@ -250,22 +257,26 @@ Return ONLY valid JSON (no markdown, no code blocks):
   "total_fiscal_impact": -1234567.89
 }}
 
-PARAGRAPH 1 - OVERVIEW (2-3 sentences):
-State the total net fiscal impact as a single number (e.g., "$20.51 billion over five years"). Indicate if this is significant, moderate, or minimal. Note if analysis uses dynamic or static scoring methodology.
+WRITE 3 CLEAR PARAGRAPHS:
 
-PARAGRAPH 2 - BREAKDOWN (3-4 sentences):
-List specific amounts for each fiscal year (e.g., "FY2026: -$4.11B, FY2027: -$4.43B"). Break down by fund type (General Revenue, Foundation School Fund, Federal Funds). Distinguish one-time vs recurring costs.
+Paragraph 1 - Bottom Line (2-3 sentences):
+State the total five-year fiscal impact as a dollar amount. Say if this is significant, moderate, or minimal for Texas. Mention if it uses static or dynamic scoring (if stated).
 
-PARAGRAPH 3 - IMPLEMENTATION (2-3 sentences):
-Detail staffing (number of FTEs and annual costs). Describe implementation timeline. Note key assumptions or contingencies.
+Paragraph 2 - Year-by-Year Breakdown (3-4 sentences):
+List the specific amount for each fiscal year (e.g., "FY2026: -$4.1B, FY2027: -$4.4B"). Break down by fund source (General Revenue, Federal Funds, etc.). Note which costs are one-time vs. recurring.
 
-TOTAL FISCAL IMPACT RULES:
-- Sum ALL fiscal years
-- NEGATIVE for costs/expenses (-20510265653.00)
-- POSITIVE for revenue/savings (1234567.89)
-- Calculate from year-by-year if no total given
+Paragraph 3 - Implementation Details (2-3 sentences):
+How many new FTEs (full-time employees) are needed and at what cost? What's the implementation timeline? Any important assumptions or conditions?
 
-Fiscal Note Text (first {text_limit} chars):
+TOTAL FISCAL IMPACT NUMBER:
+- Add up ALL fiscal years in the note
+- Use NEGATIVE for costs/expenses: -1234567.89
+- Use POSITIVE for revenue/savings: +1234567.89
+- If there's no clear total stated, calculate it from the year-by-year amounts
+
+Be specific with actual dollar amounts. Write in clear, professional language.
+
+Fiscal Note (first {text_limit} chars):
 {fiscal_note_text[:text_limit]}"""
         
         headers = {
@@ -329,48 +340,55 @@ def format_complete_response(
     fiscal_note_url: str
 ) -> str:
     """
-    Format the COMPLETE response that Agentforce will display.
-    This is the KEY function - it gives you total control over formatting!
+    Format the complete response with better visual presentation.
+    VERSION 9.2 - Improved formatting and clarity
     """
     
-    # Format the fiscal impact as currency
+    # Smart fiscal formatting
     if total_fiscal_impact < 0:
-        impact_str = f"USD -${abs(total_fiscal_impact):,.2f}"
-        if abs(total_fiscal_impact) >= 1_000_000_000:
-            impact_short = f"USD -${abs(total_fiscal_impact)/1_000_000_000:.2f} billion"
-        elif abs(total_fiscal_impact) >= 1_000_000:
-            impact_short = f"USD -${abs(total_fiscal_impact)/1_000_000:.2f} million"
+        abs_val = abs(total_fiscal_impact)
+        if abs_val >= 1_000_000_000:
+            impact_str = f"-${abs_val/1_000_000_000:.2f} billion"
+        elif abs_val >= 1_000_000:
+            impact_str = f"-${abs_val/1_000_000:.2f} million"
         else:
-            impact_short = impact_str
+            impact_str = f"-${abs_val:,.0f}"
     elif total_fiscal_impact > 0:
-        impact_str = f"USD +${total_fiscal_impact:,.2f}"
         if total_fiscal_impact >= 1_000_000_000:
-            impact_short = f"USD +${total_fiscal_impact/1_000_000_000:.2f} billion"
+            impact_str = f"+${total_fiscal_impact/1_000_000_000:.2f} billion"
         elif total_fiscal_impact >= 1_000_000:
-            impact_short = f"USD +${total_fiscal_impact/1_000_000:.2f} million"
+            impact_str = f"+${total_fiscal_impact/1_000_000:.2f} million"
         else:
-            impact_short = impact_str
+            impact_str = f"+${total_fiscal_impact:,.0f}"
     else:
-        impact_str = "No fiscal impact identified"
-        impact_short = impact_str
+        impact_str = "No fiscal impact"
     
-    # Build the formatted response
+    # Build cleaner response
     if fiscal_note_summary:
-        formatted = f"""Analysis: {bill_summary}
+        formatted = f"""📊 BILL ANALYSIS: {bill_number}
 
-Fiscal Impact: {fiscal_note_summary}
+SUMMARY
+{bill_summary}
 
-Total Fiscal Impact: {impact_short}
+💰 FISCAL IMPACT
 
-You can review the full fiscal note here: {fiscal_note_url}
+{fiscal_note_summary}
 
-Would you like to track this bill and save it to Salesforce?"""
+Five-Year Total: {impact_str}
+
+📎 View the full fiscal note: {fiscal_note_url}
+
+Would you like to save this bill to Salesforce for tracking?"""
     else:
-        formatted = f"""Analysis: {bill_summary}
+        formatted = f"""📊 BILL ANALYSIS: {bill_number}
 
-Fiscal Impact: No fiscal analysis is currently available for this bill.
+SUMMARY
+{bill_summary}
 
-Would you like to track this bill and save it to Salesforce?"""
+💰 FISCAL IMPACT
+No fiscal analysis is currently available for this bill.
+
+Would you like to save this bill to Salesforce for tracking?"""
     
     return formatted
 
@@ -464,7 +482,7 @@ def should_fetch_fiscal_note(bill_text: str) -> bool:
 def perform_bill_analysis(bill_number: str, session: str = None) -> dict:
     """
     Core bill analysis logic that can be called by multiple endpoints.
-    Returns a complete analysis dict or error dict.
+    VERSION 9.2 - Uses improved Claude prompts
     """
     if session is None:
         session = CURRENT_SESSION
@@ -526,7 +544,7 @@ def perform_bill_analysis(bill_number: str, session: str = None) -> dict:
     
     print(f"[INFO] Extracted {len(bill_text)} characters from bill")
     
-    # Generate bill summary using Claude
+    # Generate bill summary using Claude (IMPROVED PROMPT)
     bill_summary = generate_bill_summary(bill_text, formatted_bill)
     
     # Check for and process fiscal note
@@ -546,14 +564,14 @@ def perform_bill_analysis(bill_number: str, session: str = None) -> dict:
                     fiscal_text = extract_text_from_pdf_bytes(fiscal_response.content)
                     if fiscal_text:
                         print(f"[INFO] Extracted {len(fiscal_text)} characters from fiscal note")
-                        # Extract structured fiscal data using Claude
+                        # Extract structured fiscal data using Claude (IMPROVED PROMPT)
                         fiscal_data = extract_fiscal_data_with_claude(fiscal_text)
                         fiscal_note_summary = fiscal_data.get('fiscal_note_summary', '')
                         total_fiscal_impact = fiscal_data.get('total_fiscal_impact', 0)
             except Exception as e:
                 print(f"[WARN] Fiscal note fetch failed: {e}")
     
-    # Generate the FORMATTED RESPONSE for Agentforce
+    # Generate the FORMATTED RESPONSE for Agentforce (IMPROVED FORMAT)
     formatted_response = format_complete_response(
         formatted_bill,
         bill_summary,
@@ -592,10 +610,11 @@ def health():
     return jsonify({
         "ok": True,
         "service": "Texas Bill Analyzer",
-        "version": "9.1.0",
+        "version": "9.2.0",
         "features": {
             "formatted_responses": True,
             "agentforce_endpoint": True,
+            "improved_prompts": True,
             "ai_enabled": bool(INFERENCE_URL),
             "redis_caching": CACHE_ENABLED,
             "background_jobs": job_queue is not None
@@ -684,7 +703,7 @@ def analyze_bill_for_agentforce():
     """
     SIMPLIFIED ENDPOINT FOR AGENTFORCE
     Returns ONLY the formatted natural language response.
-    No complex JSON structure - just clean text for the agent to display.
+    VERSION 9.2 - Uses improved prompts and formatting
     """
     payload = request.get_json(silent=True) or {}
     bill_number = payload.get("bill_number")
@@ -734,7 +753,7 @@ def analyze_bill():
     """
     FULL ANALYSIS ENDPOINT (Original)
     Returns complete structured data for Salesforce records.
-    This endpoint returns ALL fields for backward compatibility.
+    VERSION 9.2 - Uses improved prompts
     """
     payload = request.get_json(silent=True) or {}
     bill_number = payload.get("bill_number")
@@ -815,10 +834,11 @@ def analyze_bill():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
-    print(f"[INFO] Starting Texas Bill Analyzer v9.1 on port {port}")
+    print(f"[INFO] Starting Texas Bill Analyzer v9.2 on port {port}")
     print(f"[INFO] Legislative session: {CURRENT_SESSION}")
     print(f"[INFO] AI formatting: {'Enabled' if INFERENCE_URL else 'Disabled'}")
     print(f"[INFO] Redis caching: {'Enabled' if CACHE_ENABLED else 'Disabled'}")
     print(f"[INFO] Background jobs: {'Enabled' if job_queue else 'Disabled'}")
     print(f"[INFO] Agentforce endpoint: /analyzeBillForAgentforce")
+    print(f"[INFO] Version 9.2 - Improved prompts and formatting")
     app.run(host="0.0.0.0", port=port)
